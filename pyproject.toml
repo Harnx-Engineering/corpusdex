@@ -1,0 +1,41 @@
+[project]
+name = "corpusdex"
+version = "0.1.0"
+description = "Hybrid local retrieval over a multi-repository Markdown corpus"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+requires-python = ">=3.12"
+dependencies = [
+  "sqlite-vec>=0.1.6",
+  "httpx>=0.27",
+  "PyYAML>=6.0",
+  "mcp>=2.0.0",
+]
+
+[project.scripts]
+brain = "corpusdex.cli:main"
+brain-mcp = "corpusdex.mcp_server:main"
+
+[dependency-groups]
+dev = [
+  "pytest>=8",
+  "ruff>=0.6",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/corpusdex"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
