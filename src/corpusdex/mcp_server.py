@@ -81,6 +81,13 @@ def brain_search(query: str, n: int = 8) -> dict[str, Any]:
     instead of overstating the loss as ``lexical-only``. ``channels_used``
     lists exactly which channels contributed, and ``mode`` is derived from
     it, so the two cannot disagree.
+
+    ``vector_coverage`` is a third state that ``degraded`` cannot carry:
+    ``None`` when the vector channel did not vote, otherwise the fraction of
+    the corpus it can see. Below 1.0 the ranking is not merely weaker, it is
+    biased toward whichever documents were embedded first, and the channel's
+    vote is reduced in proportion. Treat a low value as a reason to reindex
+    before trusting relative ordering, not as an error.
     """
     if n < 1:
         raise ValueError(f"n must be a positive integer, got {n}")
@@ -96,6 +103,10 @@ def brain_search(query: str, n: int = 8) -> dict[str, Any]:
         "channels_used": sorted(response.channels_used),
         "degraded": response.degraded,
         "degraded_reason": response.degraded_reason,
+        # An agent reads this payload and never sees the CLI's status line, so
+        # omitting coverage here would leave the caller most likely to act on
+        # a biased ranking as the one surface that cannot see it.
+        "vector_coverage": response.vector_coverage,
         "results": [_hit_dict(hit) for hit in response.hits],
     }
 

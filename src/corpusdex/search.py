@@ -172,6 +172,15 @@ class SearchResponse:
     #: same empty candidate list and must not produce the same status, or an
     #: ablation run silently reads as a broken run (and vice versa).
     channels_used: frozenset[str] = ALL_CHANNELS
+    #: Fraction of the corpus the voting vector channel actually covers, or
+    #: ``None`` when that channel did not vote. It is a THIRD state rather
+    #: than a second meaning for ``degraded``: full coverage, partial
+    #: coverage, and no coverage are three different answers, and ``degraded``
+    #: already carries a narrow documented meaning that an ablation run
+    #: depends on. Partial coverage is not a weaker vector signal, it is a
+    #: biased one, since it ranks only within whichever documents happened to
+    #: be embedded first.
+    vector_coverage: float | None = None
 
 
 def _snippet(body: str, limit: int = SNIPPET_CHARS) -> str:
@@ -383,6 +392,7 @@ def search(
     )
 
     vector_ids: list[int] = []
+    coverage: float | None = None
     degraded = False
     degraded_reason: str | None = None
     if CHANNEL_VECTOR not in active:
@@ -400,17 +410,48 @@ def search(
             # while Ollama was down and has not yet been backfilled) cannot
             # contribute a vector ranking, so it is degraded too.
             total_vectors = conn.execute("SELECT COUNT(*) AS n FROM vec_chunks").fetchone()["n"]
+            total_chunks = conn.execute("SELECT COUNT(*) AS n FROM chunks").fetchone()["n"]
+            if total_chunks:
+                # Clamped, because a vec row outliving the chunk it belonged to
+                # would otherwise report coverage above 1 and hand the channel
+                # MORE than a full vote.
+                coverage = min(1.0, total_vectors / total_chunks)
             if total_vectors == 0:
                 degraded = True
                 degraded_reason = "0 chunks are embedded; run `brain reindex` to backfill vectors"
             else:
                 active_embedder = embedder or default_embedder()
-                try:
-                    query_vector = active_embedder.embed([query])[0]
-                except EmbeddingUnavailable as exc:
+                active_model = getattr(active_embedder, "model", None)
+                # A model of the SAME width as the stored vectors passes every
+                # check above and is the worst of the three failures: cosine
+                # distance between two unrelated embedding spaces is still a
+                # number, so vec0 answers, fusion gives that ranking a full
+                # vote, and the page comes back looking normal, internally
+                # consistent, and meaningless. Nothing raises, so there is no
+                # exception to catch; the mismatch has to be compared for. It
+                # is compared BEFORE the query is embedded because the answer
+                # cannot change the outcome and a round trip whose result is
+                # unusable is one worth not making.
+                stale_model = db.stale_embed_model(
+                    db.get_meta(conn, db.META_EMBED_MODEL), active_model
+                )
+                if stale_model is not None:
                     degraded = True
-                    degraded_reason = f"embedding backend unavailable: {exc}"
+                    degraded_reason = (
+                        f"index was embedded with {stale_model!r} but the active "
+                        f"embedding model is {active_model!r}; vectors from "
+                        "different models are not comparable, so run "
+                        "`brain reindex` to re-embed"
+                    )
+                    query_vector = None
                 else:
+                    query_vector = None
+                    try:
+                        query_vector = active_embedder.embed([query])[0]
+                    except EmbeddingUnavailable as exc:
+                        degraded = True
+                        degraded_reason = f"embedding backend unavailable: {exc}"
+                if query_vector is not None:
                     # The embedder learns its width from the model, so a model
                     # switched since the last reindex produces a query vector
                     # the stored table cannot accept. vec0 answers that with
@@ -447,11 +488,20 @@ def search(
     # Weighted, because the graph list was derived from the other two: see
     # GRAPH_VOTE_WEIGHT. base_fused above stays unweighted, since that is the
     # ranking being seeded FROM rather than voted on.
+    #
+    # The vector channel votes in proportion to how much of the corpus it can
+    # see. This introduces no tunable constant, which is what makes it safe to
+    # land ahead of #42: at full coverage the weight is 1.0 and the fusion is
+    # arithmetically the previous one, and at zero coverage the channel is
+    # already reported degraded and contributes nothing, so weighting by
+    # coverage only makes the function continuous between two endpoints the
+    # code already implements. It is not a ranking preference being guessed at.
+    vector_weight = 1.0 if coverage is None else coverage
     fused = _fuse(
         lexical_ids,
         vector_ids,
         graph_ids,
-        weights=(1.0, 1.0, GRAPH_VOTE_WEIGHT),
+        weights=(1.0, vector_weight, GRAPH_VOTE_WEIGHT),
     )
     boosted = _apply_boosts(conn, fused)
     # Descending score, ties broken by the stable ref rather than left to dict
@@ -494,6 +544,10 @@ def search(
         degraded_reason=degraded_reason,
         hits=hits,
         channels_used=frozenset(contributed),
+        # Reported only when the vector channel actually voted, so the number
+        # always describes a channel present in this ranking rather than a
+        # property of an index that had no say in it.
+        vector_coverage=coverage if CHANNEL_VECTOR in contributed else None,
     )
 
 

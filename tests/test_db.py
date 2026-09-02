@@ -492,3 +492,27 @@ def test_recreate_vec_table_does_not_commit_the_callers_pending_work(
         assert conn.execute("SELECT count(*) FROM vec_chunks").fetchone()[0] == 1
     finally:
         conn.close()
+
+
+def test_stale_embed_model_reports_only_a_real_disagreement():
+    """Both names present and different is the only mismatch.
+
+    The three ``None`` cases are distinct situations collapsed on purpose,
+    because every one of them carries the same instruction: do nothing. An
+    index with no recorded model and a caller that cannot name its own model
+    are both unknown, and treating unknown as disagreement would degrade
+    correct configurations.
+    """
+    assert db.stale_embed_model("model-one", "model-two") == "model-one"
+    assert db.stale_embed_model("model-one", "model-one") is None
+    assert db.stale_embed_model(None, "model-two") is None
+    assert db.stale_embed_model("model-one", None) is None
+    assert db.stale_embed_model(None, None) is None
+
+
+def test_stale_embed_model_treats_an_empty_recorded_name_as_absent():
+    """An empty string in ``meta`` is a row that never got a real value, not
+    a model called "". Reporting it would name nothing useful in the reason
+    the caller then prints."""
+    assert db.stale_embed_model("", "model-two") is None
+    assert db.stale_embed_model("model-one", "") is None

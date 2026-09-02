@@ -24,8 +24,8 @@ def _build_workspace(root: Path, extra_repos: list[str] | None = None) -> None:
     )
     _write(root / "repo-a" / "docs" / "nested" / "deep.md", "# Deep\n\n" + "deep text " * 20)
     _write(root / "repo-a" / "tasks" / "todo.md", "# Todo\n\n" + "todo text " * 20)
-    # Not corpus: no matching pattern (bare file at repo root, not one of the
-    # three recognised root filenames).
+    # Not corpus: no matching pattern (a bare file at repo root that is not in
+    # ROOT_PROSE_FILES).
     _write(root / "repo-a" / "NOTES.md", "# Notes\n\nshould not be indexed\n")
     # Not corpus: inside a skipped directory.
     _write(root / "repo-a" / "node_modules" / "pkg" / "README.md", "# pkg\n\nvendored\n")
@@ -772,14 +772,20 @@ def test_embed_model_change_invalidates_and_reembeds(tmp_path: Path, vec_probe):
         conn.close()
 
     # A different model must invalidate all previously-computed vectors and
-    # re-embed everything, even though no document content changed.
+    # re-embed everything, even though no document content changed. Since #55
+    # that happens as a rebuild-and-swap rather than in place, which changes
+    # what the counters mean: a fresh index takes every document as `added`
+    # even though the corpus is identical, so `rebuilt` and `rebuild_reason`
+    # are what carry the fact that nothing about the CORPUS changed.
     second = indexer.reindex(
         db_path=db_path, workspace_root=workspace, embedder=NamedEmbedder("model-b")
     )
-    assert second.added == 0
+    assert second.rebuilt is True
+    assert "model-a" in second.rebuild_reason
+    assert "model-b" in second.rebuild_reason
+    assert second.added == second.docs_seen
     assert second.changed == 0
     assert second.embedded_chunks == second.vector_total
-    assert any("model changed" in e for e in second.errors)
 
     conn = db.connect(db_path)
     try:
@@ -1106,7 +1112,13 @@ def test_a_dead_backend_does_not_discard_vectors_on_an_apparent_model_change(
         conn.close()
     assert before > 0
 
-    indexer.reindex(db_path=db_path, workspace_root=workspace, embedder=DeadUnderANewName())
+    stats = indexer.reindex(db_path=db_path, workspace_root=workspace, embedder=DeadUnderANewName())
+
+    # And it must not take the #55 rebuild path either. A rebuild ends in a
+    # swap, and with the backend down the replacement would hold no vectors at
+    # all, so swapping it in would destroy every usable vector: worse than the
+    # in-place path this test was written to protect.
+    assert stats.rebuilt is False
 
     conn, _ = db.open_index(db_path)
     try:
@@ -1302,3 +1314,168 @@ def test_reindex_runs_against_explicit_roots_with_no_workspace_configured(
 
     assert stats.docs_seen == 1
     assert stats.added == 1
+
+
+def test_a_model_change_leaves_the_live_index_intact_until_the_swap(
+    tmp_path: Path, vec_probe, monkeypatch
+):
+    """#55: the window a concurrent reader could fall into is gone, not described.
+
+    Updating in place emptied the vector table and refilled it over a whole
+    embedding run, and readers take no lock, so a search inside that window
+    got a lexical-only page from an index that could have answered fully.
+
+    Asserted from inside ``swap_index``, which is the last instant the old
+    index is still the live one. Whatever a reader would have seen at the
+    worst possible moment is what this observes: if the destructive work had
+    happened in place, the count here would be 0.
+    """
+    if not vec_probe:
+        pytest.skip("sqlite-vec extension does not load in this environment")
+    workspace = tmp_path / "workspace"
+    db_path = tmp_path / "var" / "index.db"
+    _build_workspace(workspace)
+
+    class NamedEmbedder:
+        def __init__(self, model):
+            self.model = model
+            self.dim = db.EMBED_DIM
+
+        def probe(self):
+            pass
+
+        def embed(self, texts):
+            return [[0.1] * self.dim for _ in texts]
+
+    indexer.reindex(db_path=db_path, workspace_root=workspace, embedder=NamedEmbedder("model-a"))
+    conn, _ = db.open_index(db_path)
+    try:
+        before = conn.execute("SELECT count(*) FROM vec_chunks").fetchone()[0]
+    finally:
+        conn.close()
+    assert before > 0
+
+    observed: dict[str, object] = {}
+    real_swap = db.swap_index
+
+    def watching_swap(work_path, target_path):
+        reader_conn, _vec_ok = db.open_index(target_path)
+        try:
+            observed["vectors"] = reader_conn.execute(
+                "SELECT count(*) FROM vec_chunks"
+            ).fetchone()[0]
+            observed["model"] = db.get_meta(reader_conn, db.META_EMBED_MODEL)
+        finally:
+            reader_conn.close()
+        return real_swap(work_path, target_path)
+
+    monkeypatch.setattr(db, "swap_index", watching_swap)
+    stats = indexer.reindex(
+        db_path=db_path, workspace_root=workspace, embedder=NamedEmbedder("model-b")
+    )
+
+    assert stats.rebuilt is True
+    # The live index still held every old vector, under the old model name,
+    # right up to the swap.
+    assert observed["vectors"] == before
+    assert observed["model"] == "model-a"
+    # And afterwards it is the new one, complete.
+    conn, _ = db.open_index(db_path)
+    try:
+        assert conn.execute("SELECT count(*) FROM vec_chunks").fetchone()[0] == before
+        assert db.get_meta(conn, db.META_EMBED_MODEL) == "model-b"
+    finally:
+        conn.close()
+
+
+def test_discover_corpus_matches_decisions_and_specs_directories(tmp_path: Path):
+    """A registered repo may keep its durable prose outside ``docs/``.
+
+    ``docs`` alone was the whole proxy for "written to be read later", which
+    held until a registered repo turned out not to use it: one keeps its
+    ADRs in ``decisions/`` and its RFCs in ``specs/``, including the rules
+    governing how the rest of the pack may be edited. Its ``docs/`` WAS
+    indexed, so a query returned plausible results and gave no signal that the
+    decision record behind them had never been searched.
+    """
+    _write(tmp_path / "repo-a" / "decisions" / "0001-pick-a-runtime.md", "# ADR\n\n" + "t " * 20)
+    _write(tmp_path / "repo-a" / "specs" / "0000-rfc-process.md", "# RFC\n\n" + "t " * 20)
+    # Nested one level down, the same way docs/ is matched at any depth.
+    _write(tmp_path / "repo-a" / "engine" / "specs" / "0002-wire.md", "# Wire\n\n" + "t " * 20)
+    write_registry(tmp_path, ["repo-a"])
+    rel_paths = {d.rel_path for d in indexer.discover_corpus(tmp_path)}
+    assert "repo-a/decisions/0001-pick-a-runtime.md" in rel_paths
+    assert "repo-a/specs/0000-rfc-process.md" in rel_paths
+    assert "repo-a/engine/specs/0002-wire.md" in rel_paths
+
+
+def test_a_prose_directory_inside_a_skipped_tree_is_still_skipped(tmp_path: Path):
+    """Widening the accepted names must not widen what the skip list guards.
+
+    An in-flight agent worktree nested inside a repo carries a full duplicate
+    of that repo, `decisions/` included, so this is the shape in which the
+    widening would multiply every ADR by the number of live worktrees.
+    """
+    _write(tmp_path / "repo-a" / "AGENTS.md", "# A\n\n" + "t " * 20)
+    _write(
+        tmp_path / "repo-a" / ".claude" / "worktrees" / "agent-1" / "decisions" / "0001-x.md",
+        "# duplicate\n\nshould not be indexed\n",
+    )
+    _write(
+        tmp_path / "repo-a" / "node_modules" / "pkg" / "specs" / "0000-vendor.md",
+        "# vendored\n\nshould not be indexed\n",
+    )
+    write_registry(tmp_path, ["repo-a"])
+    rel_paths = {d.rel_path for d in indexer.discover_corpus(tmp_path)}
+    assert not any("worktrees" in p for p in rel_paths)
+    assert not any("node_modules" in p for p in rel_paths)
+
+
+def test_governance_is_root_prose_but_the_boilerplate_pair_is_not(tmp_path: Path):
+    """Pins a deliberate EXCLUSION, which is the half that rots quietly.
+
+    ``SECURITY.md`` and ``CONTRIBUTING.md`` look like obvious omissions next to
+    ``GOVERNANCE.md``, and the reason they are absent is measurement rather
+    than taste: 18 of the 19 registered repos carrying ``SECURITY.md`` hold a
+    byte-identical 52-line copy, and ``CONTRIBUTING.md`` is the same template
+    with the repo name substituted. The largest retrieval defect ever measured
+    against this index was near-duplicate crowding, so admitting eighteen
+    copies of one document would cost ranking and buy nothing. Without this
+    test the next reader adds them as an oversight.
+    """
+    for name in ("GOVERNANCE.md", "SECURITY.md", "CONTRIBUTING.md", "NOTES.md"):
+        _write(tmp_path / "repo-a" / name, f"# {name}\n\n" + "text " * 20)
+    write_registry(tmp_path, ["repo-a"])
+    rel_paths = {d.rel_path for d in indexer.discover_corpus(tmp_path)}
+    assert "repo-a/GOVERNANCE.md" in rel_paths
+    assert "repo-a/SECURITY.md" not in rel_paths
+    assert "repo-a/CONTRIBUTING.md" not in rel_paths
+    assert "repo-a/NOTES.md" not in rel_paths
+
+
+def test_the_workspace_roots_own_prose_walk_still_does_not_cross_into_siblings(
+    tmp_path: Path,
+):
+    """The shallow branch grew from one directory to three; it must stay shallow.
+
+    The workspace root's walk is deliberately NOT the full-tree one: rooted
+    there, a full walk crosses into every sibling directory including
+    unregistered stale checkouts, reintroducing the whole-workspace scan the
+    registry exists to prevent. Iterating three names instead of one is exactly
+    the kind of edit that invites collapsing them into a single walk.
+    """
+    _write(tmp_path / "decisions" / "0001-workspace-level.md", "# WS ADR\n\n" + "t " * 20)
+    _write(tmp_path / "specs" / "0000-workspace-rfc.md", "# WS RFC\n\n" + "t " * 20)
+    _write(
+        tmp_path / "unregistered-checkout" / "decisions" / "0001-leaked.md",
+        "# leaked\n\nshould not be indexed\n",
+    )
+    _write(
+        tmp_path / "unregistered-checkout" / "deep" / "specs" / "0000-leaked.md",
+        "# leaked\n\nshould not be indexed\n",
+    )
+    write_registry(tmp_path, [])
+    rel_paths = {d.rel_path for d in indexer.discover_corpus(tmp_path)}
+    assert "decisions/0001-workspace-level.md" in rel_paths
+    assert "specs/0000-workspace-rfc.md" in rel_paths
+    assert not any("unregistered-checkout" in p for p in rel_paths)

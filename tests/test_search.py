@@ -719,3 +719,209 @@ def test_a_model_of_another_width_degrades_instead_of_raising(vec_conn, stub_emb
     # Degraded is not empty: the lexical channel still answers the query.
     assert len(response.hits) == 1
     assert response.channels_used == frozenset({search.CHANNEL_LEXICAL})
+
+
+def test_a_model_of_the_same_width_degrades_because_its_vectors_are_incomparable(vec_conn):
+    """The width check cannot see this one, and it is the worse failure.
+
+    Two models of the same width produce vectors in unrelated spaces. Cosine
+    distance between them is still a number, so vec0 answers, fusion gives
+    that ranking a full vote, and the page comes back looking normal and
+    meaning nothing. Nothing raises, so there is no exception a caller could
+    have caught: the mismatch has to be compared for.
+    """
+    from conftest import StubEmbedder
+
+    chunk_id = _insert_doc_with_chunk(vec_conn, path="a.md", body="findable content about widgets")
+    _insert_vector(vec_conn, chunk_id)
+    db.set_meta(vec_conn, db.META_EMBED_MODEL, "model-one")
+
+    other = StubEmbedder(dim=db.EMBED_DIM, model="model-two")
+    response = search.search(vec_conn, vec_ok=True, query="widgets", embedder=other)
+
+    assert response.degraded is True
+    # Both names, because the reason has to say what the index holds AND what
+    # is configured now; either one alone leaves the reader guessing which
+    # half to change.
+    assert "model-one" in response.degraded_reason
+    assert "model-two" in response.degraded_reason
+    assert "reindex" in response.degraded_reason
+    # Degrading is not refusing: the lexical channel still answers.
+    assert len(response.hits) == 1
+    assert response.channels_used == frozenset({search.CHANNEL_LEXICAL})
+
+
+def test_a_stale_model_is_detected_without_embedding_the_query(vec_conn):
+    """The comparison happens before the round trip, not after it.
+
+    Embedding first and comparing afterwards would give the same answer at the
+    cost of a request whose result can never be used, which on a cold local
+    model is seconds of latency for a query that is already decided.
+    """
+    from conftest import StubEmbedder
+
+    chunk_id = _insert_doc_with_chunk(vec_conn, path="a.md", body="findable content about widgets")
+    _insert_vector(vec_conn, chunk_id)
+    db.set_meta(vec_conn, db.META_EMBED_MODEL, "model-one")
+
+    other = StubEmbedder(dim=db.EMBED_DIM, model="model-two")
+    response = search.search(vec_conn, vec_ok=True, query="widgets", embedder=other)
+
+    assert response.degraded is True
+    assert other.calls == []
+
+
+def test_an_index_with_no_recorded_model_is_not_treated_as_stale(vec_conn):
+    """Absence is unknown, not disagreement.
+
+    An index built before ``meta.embed_model`` was written has no stored name.
+    Collapsing that into a mismatch would degrade the vector channel on every
+    such index until someone reindexed, for a configuration that may be
+    perfectly correct.
+    """
+    from conftest import StubEmbedder
+
+    chunk_id = _insert_doc_with_chunk(vec_conn, path="a.md", body="findable content about widgets")
+    _insert_vector(vec_conn, chunk_id)
+    assert db.get_meta(vec_conn, db.META_EMBED_MODEL) is None
+
+    embedder = StubEmbedder(dim=db.EMBED_DIM, model="model-two")
+    response = search.search(vec_conn, vec_ok=True, query="widgets", embedder=embedder)
+
+    assert response.degraded is False
+    assert response.degraded_reason is None
+    assert search.CHANNEL_VECTOR in response.channels_used
+    assert embedder.calls != []
+
+
+def _spy_on_fuse(monkeypatch) -> list[tuple[float, ...] | None]:
+    """Record the weights every ``_fuse`` call receives.
+
+    Asserted at the seam rather than through scores, for the reason
+    test_search_gives_the_graph_list_the_discounted_weight already states: a
+    weight applied to the wrong list produces a ranking that is merely
+    different, and no score assertion separates that from a corpus change.
+    """
+    seen: list[tuple[float, ...] | None] = []
+    real_fuse = search._fuse
+
+    def spy(*ranked_lists, weights=None):
+        seen.append(weights)
+        return real_fuse(*ranked_lists, weights=weights)
+
+    monkeypatch.setattr(search, "_fuse", spy)
+    return seen
+
+
+def _partially_embedded(conn, *, embedded: int, total: int) -> None:
+    """Insert ``total`` chunks and give vectors to only the first ``embedded``."""
+    for i in range(total):
+        chunk_id = _insert_doc_with_chunk(
+            conn, path=f"doc-{i}.md", body=f"widgets and gadgets number {i}"
+        )
+        if i < embedded:
+            _insert_vector(conn, chunk_id)
+
+
+def test_partial_vector_coverage_is_reported_rather_than_read_as_healthy(vec_conn, stub_embedder):
+    """An index that is a quarter embedded used to answer `mode: lexical+vector`
+    with `degraded: false`, so nothing on the page looked wrong.
+
+    This is the ordinary path, not an edge case: embedding is decoupled from
+    change detection, so any index built or grown while the backend was down
+    is partially embedded until a later reindex backfills it.
+    """
+    _partially_embedded(vec_conn, embedded=1, total=4)
+
+    response = search.search(vec_conn, vec_ok=True, query="widgets", embedder=stub_embedder)
+
+    assert response.vector_coverage == 0.25
+    # Not degraded: the channel DID vote. Partial coverage is a third state,
+    # and folding it into the boolean would make an ablation run and a
+    # half-built index indistinguishable.
+    assert response.degraded is False
+    assert search.CHANNEL_VECTOR in response.channels_used
+
+
+def test_partial_coverage_reduces_the_vector_channels_vote(vec_conn, stub_embedder, monkeypatch):
+    """Partial coverage is a BIASED signal, not a weaker one: the channel ranks
+    only within whichever documents happened to be embedded first, and
+    reciprocal-rank fusion otherwise hands that subset a full vote."""
+    _partially_embedded(vec_conn, embedded=1, total=4)
+    seen = _spy_on_fuse(monkeypatch)
+
+    search.search(vec_conn, vec_ok=True, query="widgets", embedder=stub_embedder)
+
+    assert seen[-1] == (1.0, 0.25, search.GRAPH_VOTE_WEIGHT)
+
+
+def test_full_coverage_leaves_the_fusion_arithmetically_unchanged(
+    vec_conn, stub_embedder, monkeypatch
+):
+    """The endpoint that makes this safe to land ahead of the judged set in #42.
+
+    At full coverage the weight is exactly 1.0, so a healthy index fuses
+    precisely as it did before coverage existed. There is no constant here to
+    tune and therefore nothing for an evaluation to arbitrate.
+    """
+    _partially_embedded(vec_conn, embedded=3, total=3)
+    seen = _spy_on_fuse(monkeypatch)
+
+    response = search.search(vec_conn, vec_ok=True, query="widgets", embedder=stub_embedder)
+
+    assert response.vector_coverage == 1.0
+    assert seen[-1] == (1.0, 1.0, search.GRAPH_VOTE_WEIGHT)
+
+
+def test_coverage_is_absent_when_the_vector_channel_did_not_vote(lexical_conn):
+    """``None`` rather than 0.0. A channel that never ran has no coverage to
+    report, and 0.0 would read as "ran and saw nothing", which is the state
+    the degraded flag already describes.
+
+    Weak on its own: with no vec table the coverage is never computed, so this
+    passes whether or not the guard on the response field exists. The case
+    that actually exercises the guard is the next test.
+    """
+    _insert_doc_with_chunk(lexical_conn, path="a.md", body="widgets and gadgets")
+
+    response = search.search(lexical_conn, vec_ok=False, query="widgets")
+
+    assert response.vector_coverage is None
+
+
+def test_coverage_is_withheld_when_it_was_computed_but_the_channel_still_lost(vec_conn):
+    """The state where the guard is the only thing standing: coverage IS known
+    and the channel still did not vote.
+
+    A partially embedded index with an unreachable backend computes coverage
+    from the rows it holds, then degrades before producing a query vector, so
+    the vector channel contributes nothing. Reporting the number anyway would
+    describe a channel absent from this ranking, and a caller reading
+    "coverage 0.25" would reasonably conclude a quarter-strength vector vote
+    was included when there was none.
+    """
+    from conftest import FailingEmbedder
+
+    _partially_embedded(vec_conn, embedded=1, total=4)
+
+    response = search.search(
+        vec_conn, vec_ok=True, query="widgets", embedder=FailingEmbedder()
+    )
+
+    assert response.degraded is True
+    assert search.CHANNEL_VECTOR not in response.channels_used
+    assert response.vector_coverage is None
+
+
+def test_coverage_is_clamped_when_a_vector_outlives_its_chunk(vec_conn, stub_embedder):
+    """A vec row left behind by a deleted chunk would push the ratio above 1
+    and hand the channel MORE than a full vote, which is the one direction
+    this must never move."""
+    chunk_id = _insert_doc_with_chunk(vec_conn, path="a.md", body="widgets and gadgets")
+    _insert_vector(vec_conn, chunk_id)
+    # A second vector row for a chunk id that no longer exists.
+    _insert_vector(vec_conn, chunk_id + 999)
+
+    response = search.search(vec_conn, vec_ok=True, query="widgets", embedder=stub_embedder)
+
+    assert response.vector_coverage == 1.0

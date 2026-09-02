@@ -559,6 +559,32 @@ def get_meta(conn: sqlite3.Connection, key: str) -> str | None:
     return None if row is None else row["value"]
 
 
+def stale_embed_model(stored_model: str | None, active_model: str | None) -> str | None:
+    """Return ``stored_model`` when it disagrees with ``active_model``, else ``None``.
+
+    A pure comparison rather than a query, because its two callers read the
+    stored name at different points: search holds a connection, status has
+    already closed one by the time it knows the active model.
+
+    ``None`` means "nothing to report", which deliberately covers three
+    different situations because all three carry the same instruction, do
+    nothing: the names agree; the index predates the ``embed_model`` row and
+    has no stored name; or the caller cannot name its active model. Absence on
+    either side is unknown, not equal, and treating unknown as a mismatch
+    would degrade every search against an older index for no reason.
+
+    This is the one place the comparison lives. Two vector sets produced by
+    different models occupy unrelated spaces, so the same predicate has to
+    decide both whether a search may use its vector channel and whether
+    ``brain status`` calls the configuration stale. A second copy would be
+    free to drift into answering those two questions differently, and the
+    surface that answered "healthy" would be the one people believe.
+    """
+    if not stored_model or not active_model:
+        return None
+    return None if stored_model == active_model else stored_model
+
+
 def set_meta(conn: sqlite3.Connection, key: str, value: str) -> None:
     conn.execute(
         "INSERT INTO meta(key, value) VALUES (?, ?) "

@@ -1219,3 +1219,139 @@ def test_a_work_log_declaring_its_own_supersedence_is_not_dropped(tmp_path: Path
         ) in _edges(conn)
     finally:
         conn.close()
+
+
+def _two_repo_adr_workspace(tmp_path: Path, *, citing_repo: str, body: str):
+    """Two registered repos that each number a decision 0006, plus a citer.
+
+    This is the collision that stops being hypothetical the moment more than
+    one repo's ``decisions/`` tree is in the corpus. A decision number is a
+    repo-LOCAL identifier: every repo numbers its records from 0001, so the
+    overlap is the normal case, not an accident. In the live workspace two
+    repos overlap on eleven numbers.
+    """
+    workspace = tmp_path / "workspace"
+    _write(
+        workspace / "repo-a/decisions/0006-tenant-default.md",
+        f"# Tenant default\n\n## Body\n\n{FILLER}\n",
+    )
+    _write(
+        workspace / "repo-b/decisions/0006-binary-name.md",
+        f"# Binary name\n\n## Body\n\n{FILLER}\n",
+    )
+    _write(workspace / f"{citing_repo}/docs/citing.md", f"# Citing\n\n## Body\n\n{body}\n")
+    write_registry(workspace, ["repo-a", "repo-b"])
+    return workspace
+
+
+def test_a_decision_number_resolves_inside_the_citing_documents_own_repo(tmp_path: Path):
+    """The number means the citer's own record, and no ambiguity rule can see that.
+
+    Both candidates are equally good workspace-wide, so declining, which is the
+    correct answer for an ambiguous NAME, is the wrong answer here. Measured on
+    the live corpus: without this, widening the walk destroys 25 existing edges,
+    all of them context cards citing their own repo's decisions, which are the
+    graph's hub documents.
+    """
+    workspace = _two_repo_adr_workspace(
+        tmp_path, citing_repo="repo-a", body=f"{FILLER} this extends decision 0006 in full."
+    )
+    db_path = tmp_path / "var" / "index.db"
+    indexer.reindex(db_path=db_path, workspace_root=workspace, embedder=StubEmbedder())
+    conn, _vec = db.open_index(db_path)
+    try:
+        assert _edges(conn) == {
+            ("repo-a/docs/citing.md", "repo-a/decisions/0006-tenant-default.md", "links_to")
+        }
+    finally:
+        conn.close()
+
+
+def test_the_same_number_from_the_other_repo_resolves_to_that_repos_record(tmp_path: Path):
+    """The mirror arm. Without it the test above passes on a resolver that
+    simply always picks repo-a, e.g. by iteration order over the candidates."""
+    workspace = _two_repo_adr_workspace(
+        tmp_path, citing_repo="repo-b", body=f"{FILLER} this extends decision 0006 in full."
+    )
+    db_path = tmp_path / "var" / "index.db"
+    indexer.reindex(db_path=db_path, workspace_root=workspace, embedder=StubEmbedder())
+    conn, _vec = db.open_index(db_path)
+    try:
+        assert _edges(conn) == {
+            ("repo-b/docs/citing.md", "repo-b/decisions/0006-binary-name.md", "links_to")
+        }
+    finally:
+        conn.close()
+
+
+def test_two_records_sharing_a_number_inside_one_repo_are_still_declined(tmp_path: Path):
+    """Repo scoping must not turn the collision it fixes into a licence to guess.
+
+    Two records taking one number INSIDE a repo has happened three times here,
+    and the resolver has always declined it. What this test pins is the OUTCOME
+    (no edge) and the COUNTER it lands in (unlinkable, not unresolved), because
+    the two call for opposite responses from whoever reads the report.
+
+    What it deliberately does NOT claim, having been checked: it does not pin
+    that the repo bucket declines rather than falling through to the global
+    one. Those two are equivalent by construction, since the repo bucket is a
+    subset of the global bucket, so an ambiguous repo bucket guarantees an
+    ambiguous global bucket. A mutant that replaces the early return with a
+    fall-through SURVIVES this test, and no fixture can change that. Said out
+    loud because a test whose name promises more than it delivers is worse than
+    an absent one.
+    """
+    workspace = tmp_path / "workspace"
+    _write(
+        workspace / "repo-a/decisions/0006-tenant-default.md",
+        f"# Tenant default\n\n## Body\n\n{FILLER}\n",
+    )
+    _write(
+        workspace / "repo-a/decisions/0006-a-second-record-taking-the-same-number.md",
+        f"# Second record\n\n## Body\n\n{FILLER}\n",
+    )
+    _write(
+        workspace / "repo-a/docs/citing.md",
+        f"# Citing\n\n## Body\n\n{FILLER} this extends decision 0006 in full.\n",
+    )
+    write_registry(workspace, ["repo-a"])
+    db_path = tmp_path / "var" / "index.db"
+    stats = indexer.reindex(db_path=db_path, workspace_root=workspace, embedder=StubEmbedder())
+    conn, _vec = db.open_index(db_path)
+    try:
+        assert _edges(conn) == set()
+    finally:
+        conn.close()
+    # Declined, not missing: the two counters call for opposite responses, and
+    # reporting this as "unresolved" would send someone looking for a document
+    # that exists twice.
+    assert stats.link_targets_unlinkable == 1
+    assert stats.link_targets_unresolved == 0
+
+
+def test_a_repo_with_no_decisions_of_its_own_still_resolves_workspace_wide(tmp_path: Path):
+    """The global fallback is load-bearing, not vestigial.
+
+    The workspace root and the skills directory hold no ``decisions/``, so
+    every decision citation they make can only be answered globally. A repo
+    bucket miss must fall through rather than decline.
+    """
+    workspace = tmp_path / "workspace"
+    _write(
+        workspace / "repo-a/decisions/0006-tenant-default.md",
+        f"# Tenant default\n\n## Body\n\n{FILLER}\n",
+    )
+    _write(
+        workspace / "repo-b/docs/citing.md",
+        f"# Citing\n\n## Body\n\n{FILLER} this extends decision 0006 in full.\n",
+    )
+    write_registry(workspace, ["repo-a", "repo-b"])
+    db_path = tmp_path / "var" / "index.db"
+    indexer.reindex(db_path=db_path, workspace_root=workspace, embedder=StubEmbedder())
+    conn, _vec = db.open_index(db_path)
+    try:
+        assert _edges(conn) == {
+            ("repo-b/docs/citing.md", "repo-a/decisions/0006-tenant-default.md", "links_to")
+        }
+    finally:
+        conn.close()

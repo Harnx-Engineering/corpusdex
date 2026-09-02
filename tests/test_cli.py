@@ -418,8 +418,10 @@ def test_status_flags_a_model_the_index_was_not_built_with(
     assert payload["embed_config_stale"] is None
     assert payload["fully_embedded"] is True
 
-    # Same width, different model: no error would ever be raised, so status is
-    # the only place this can be caught.
+    # Same width, different model: no error would ever be raised anywhere, so
+    # it has to be compared for. Search now refuses its vector channel on the
+    # same predicate (db.stale_embed_model); status is the surface that says
+    # so before a query is run, not the only one that notices.
     monkeypatch.setattr(cli, "default_embedder", lambda: StubEmbedder(model="model-two"))
     payload = cli.status_payload()
     assert payload["fully_embedded"] is False
@@ -432,3 +434,139 @@ def test_status_flags_a_model_the_index_was_not_built_with(
     payload = cli.status_payload()
     assert payload["fully_embedded"] is False
     assert any("384" in reason for reason in payload["embed_config_stale"])
+
+
+def test_status_flags_a_stale_model_even_when_the_backend_is_unreachable(
+    tmp_path, monkeypatch, vec_probe
+):
+    """The case that matters most is the one a backend-health guard hid.
+
+    Switching to a model that has not been pulled yet makes the readiness
+    probe fail, and the staleness block used to sit entirely behind that
+    probe. Status then reported no stale configuration for exactly the setup
+    ``brain search`` was already refusing to use its vector channel on. A
+    model comparison needs no backend: the name is configuration, not a
+    measurement. A width comparison does, and stays behind the probe.
+    """
+    if not vec_probe:
+        pytest.skip("sqlite-vec extension does not load in this environment")
+    from conftest import FailingEmbedder, StubEmbedder
+
+    workspace = tmp_path / "workspace"
+    db_path = tmp_path / "var" / "index.db"
+    _write(workspace / "repo-a" / "AGENTS.md", "# A\n\n## S\n\n" + "content here. " * 20)
+    write_registry(workspace, ["repo-a"])
+    monkeypatch.setenv("BRAIN_WORKSPACE_ROOT", str(workspace))
+    monkeypatch.setenv("BRAIN_DB", str(db_path))
+
+    indexer.reindex(
+        db_path=db_path, workspace_root=workspace, embedder=StubEmbedder(model="model-one")
+    )
+
+    monkeypatch.setattr(cli, "default_embedder", lambda: FailingEmbedder())
+    payload = cli.status_payload()
+
+    assert payload["embed_backend_live"] == "unavailable"
+    assert payload["embed_config_stale"] is not None
+    assert any("model-one" in reason for reason in payload["embed_config_stale"])
+    assert any("unreachable-model" in reason for reason in payload["embed_config_stale"])
+    assert payload["fully_embedded"] is False
+
+
+def test_cli_search_prints_partial_vector_coverage(tmp_path, monkeypatch, capsys, vec_probe):
+    """A number nobody renders is the same silence the issue described.
+
+    The half-embedded index answered `mode: lexical+vector` with
+    `degraded: false`, so the page carried no sign that the vector channel was
+    ranking within a subset. Both surfaces have to say so: the JSON field for
+    programmatic callers, the status line for a person reading a terminal.
+    """
+    if not vec_probe:
+        pytest.skip("sqlite-vec extension does not load in this environment")
+    from conftest import StubEmbedder
+
+    workspace = tmp_path / "workspace"
+    db_path = tmp_path / "var" / "index.db"
+    for i in range(4):
+        # Under docs/, not at the repo root: the indexer walks docs/ plus a
+        # fixed set of root filenames, so a doc-0.md at the root is not corpus
+        # at all and this fixture would index nothing (issue #34).
+        _write(
+            workspace / "repo-a" / "docs" / f"doc-{i}.md",
+            f"# Doc {i}\n\n## Cache invalidation rules\n\n" + "keep the cache consistent. " * 10,
+        )
+    write_registry(workspace, ["repo-a"])
+    monkeypatch.setenv("BRAIN_WORKSPACE_ROOT", str(workspace))
+    monkeypatch.setenv("BRAIN_DB", str(db_path))
+    monkeypatch.setattr(cli, "default_embedder", lambda: StubEmbedder())
+    indexer.reindex(db_path=db_path, workspace_root=workspace, embedder=StubEmbedder())
+
+    # Strip vectors from all but one chunk, which is exactly the state an index
+    # grown while the backend was down is left in.
+    conn, _vec_ok = db.open_index(db_path)
+    try:
+        keep = conn.execute("SELECT MIN(id) AS id FROM chunks").fetchone()["id"]
+        with conn:
+            conn.execute("DELETE FROM vec_chunks WHERE chunk_id != ?", (keep,))
+        remaining = conn.execute("SELECT COUNT(*) AS n FROM vec_chunks").fetchone()["n"]
+        total = conn.execute("SELECT COUNT(*) AS n FROM chunks").fetchone()["n"]
+    finally:
+        conn.close()
+    assert remaining == 1
+    assert total > 1
+
+    assert cli.main(["search", "cache invalidation rules", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["vector_coverage"] == pytest.approx(remaining / total)
+    assert payload["degraded"] is False
+
+    assert cli.main(["search", "cache invalidation rules"]) == 0
+    out = capsys.readouterr().out
+    assert "partial vectors" in out
+    assert "reindex" in out
+
+
+def test_cli_reindex_says_when_it_rebuilt_and_why(tmp_path, monkeypatch, capsys, vec_probe):
+    """The counters are misleading without this line, so it has to be printed.
+
+    On a rebuild every document counts as `added` even when the corpus is
+    identical, so `+4 added` is a fact about a fresh index rather than about
+    the corpus. A reader who sees only the counters concludes four documents
+    appeared.
+    """
+    if not vec_probe:
+        pytest.skip("sqlite-vec extension does not load in this environment")
+    from conftest import StubEmbedder
+
+    workspace = tmp_path / "workspace"
+    db_path = tmp_path / "var" / "index.db"
+    for i in range(4):
+        _write(
+            workspace / "repo-a" / "docs" / f"doc-{i}.md",
+            f"# Doc {i}\n\n## Cache invalidation rules\n\n" + "keep the cache consistent. " * 10,
+        )
+    write_registry(workspace, ["repo-a"])
+    monkeypatch.setenv("BRAIN_WORKSPACE_ROOT", str(workspace))
+    monkeypatch.setenv("BRAIN_DB", str(db_path))
+
+    monkeypatch.setattr(cli, "default_embedder", lambda: StubEmbedder(model="model-a"))
+    assert cli.main(["reindex"]) == 0
+    capsys.readouterr()
+
+    # A second run under a different model name: nothing about the corpus
+    # changed, so the rebuild must be stated rather than inferred.
+    monkeypatch.setattr(cli, "default_embedder", lambda: StubEmbedder(model="model-b"))
+    assert cli.main(["reindex"]) == 0
+    out = capsys.readouterr().out
+    assert "rebuilt the index" in out
+    assert "model-a" in out
+    assert "model-b" in out
+    # Ordering matters: the explanation has to reach the reader before the
+    # counters it explains.
+    assert out.index("rebuilt the index") < out.index("added")
+
+    assert cli.main(["reindex", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    # Third run, same model, nothing to rebuild.
+    assert payload["rebuilt"] is False
+    assert payload["rebuild_reason"] is None

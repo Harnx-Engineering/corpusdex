@@ -113,6 +113,7 @@ def cmd_search(args: argparse.Namespace) -> int:
                     "channels_used": sorted(response.channels_used),
                     "degraded": response.degraded,
                     "degraded_reason": response.degraded_reason,
+                    "vector_coverage": response.vector_coverage,
                     "results": [_hit_dict(hit) for hit in response.hits],
                 },
                 indent=2,
@@ -126,6 +127,18 @@ def cmd_search(args: argparse.Namespace) -> int:
         # `mode` now names the channels that ran, so this no longer has to
         # correct it; the reason is the part the mode label cannot carry.
         status_line += f"  degraded: {reason}"
+    # Printed, not merely returned. A partially embedded index answered with
+    # `mode: lexical+vector` and `degraded: false`, so nothing on the page
+    # looked wrong while the vector channel was ranking within whichever
+    # documents happened to be embedded first. A number nobody renders is the
+    # same silence.
+    if response.vector_coverage is not None and response.vector_coverage < 1.0:
+        percent = response.vector_coverage * 100
+        status_line += (
+            f"  partial vectors: {percent:.1f}% of the corpus is embedded, so the "
+            "vector channel votes over that subset and its weight is reduced to "
+            "match; run `brain reindex` to backfill"
+        )
     print(status_line)
     if not response.hits:
         print("no results")
@@ -227,6 +240,8 @@ def cmd_reindex(args: argparse.Namespace) -> int:
                     "link_targets_from_work_logs": stats.link_targets_from_work_logs,
                     "superseded_by_unresolved": list(stats.superseded_by_unresolved),
                     "duration_seconds": round(stats.duration_seconds, 3),
+                    "rebuilt": stats.rebuilt,
+                    "rebuild_reason": stats.rebuild_reason,
                     "errors": stats.errors,
                 },
                 indent=2,
@@ -234,6 +249,13 @@ def cmd_reindex(args: argparse.Namespace) -> int:
         )
         return 0
 
+    # Printed BEFORE the counters, because it changes how they read: on a
+    # rebuild every document counts as added even when none of them changed,
+    # so "+328 added" is a fact about a fresh index rather than about the
+    # corpus, and a reader who sees the counters first has already drawn the
+    # wrong conclusion.
+    if stats.rebuilt:
+        print(f"rebuilt the index and swapped it in: {stats.rebuild_reason}")
     print(
         f"scanned {stats.docs_seen} docs: "
         f"+{stats.added} added, {stats.changed} changed, "
@@ -373,16 +395,24 @@ def status_payload(db_path: Path | None = None) -> dict:
     # same width silently compares new queries against old document vectors,
     # which produces plausible but meaningless rankings and no error anywhere.
     stale_reasons = []
+    # The two halves need different evidence and so cannot share a guard. A
+    # WIDTH comparison needs the backend to say what it produces, so it is
+    # only meaningful when the probe succeeded. A MODEL comparison needs
+    # nothing but configuration, and gating it on backend health silenced it
+    # in the one case that matters most: switching to a model that is not
+    # pulled yet makes the probe fail, and status then reported no staleness
+    # for a configuration search was already refusing to use. Same predicate
+    # as search, so the two surfaces cannot disagree.
+    if db.stale_embed_model(embed_model, embedder.model) is not None:
+        stale_reasons.append(
+            f"index was embedded with {embed_model!r}, active model is "
+            f"{embedder.model!r}"
+        )
     if embed_live == "ready":
         if index_dim is not None and live_dim and live_dim != index_dim:
             stale_reasons.append(
                 f"index holds {index_dim}-dimension vectors, active model "
                 f"{embedder.model!r} produces {live_dim}"
-            )
-        if embed_model and embed_model != embedder.model:
-            stale_reasons.append(
-                f"index was embedded with {embed_model!r}, active model is "
-                f"{embedder.model!r}"
             )
 
     fully_embedded = (

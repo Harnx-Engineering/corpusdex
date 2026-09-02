@@ -316,6 +316,14 @@ class ReindexStats:
     superseded_by_unresolved: tuple[str, ...] = ()
     duration_seconds: float = 0.0
     errors: list[str] = field(default_factory=list)
+    #: Whether this run built a replacement index and swapped it in, rather
+    #: than updating the live one. It has to be reported, because on a rebuild
+    #: EVERY document counts as ``added`` even when none of them changed, so
+    #: without this the counters read as "328 new documents" for a run whose
+    #: corpus was identical.
+    rebuilt: bool = False
+    #: Why, in words a person can act on. ``None`` when ``rebuilt`` is False.
+    rebuild_reason: str | None = None
 
     @property
     def touched(self) -> int:
@@ -397,35 +405,64 @@ def _walk_markdown(base: Path) -> Iterator[Path]:
                 yield Path(dirpath) / name
 
 
+#: Directory names whose markdown is durable prose rather than source. The
+#: test is a proxy for "someone wrote this to be read later", and ``docs`` was
+#: the whole proxy until a registered repo turned out not to use it: one
+#: keeps its ADRs in ``decisions/`` and its RFCs in ``specs/``, so its most
+#: authoritative content, including the rules governing how the rest may be
+#: edited, was invisible to search while its ``docs/`` answered queries. That is
+#: the failure this index exists to prevent, because a caller gets results and
+#: reasonably concludes it has seen what the corpus holds.
+#:
+#: Measured before choosing this over a skip-list inversion: across the twenty
+#: registered repos, ``decisions/`` exists in exactly two (the knowledge
+#: repo, already walked whole, and one other) and ``specs/`` in one.
+#: So the accepted-list costs 19 documents, all from one repo, while inverting
+#: to a skip-list would have pulled in roughly 200 mostly source-adjacent files
+#: and widened the surface :data:`SKIP_DIR_NAMES` exists to narrow.
+PROSE_DIR_NAMES = frozenset({"docs", "decisions", "specs"})
+
+#: Repo-root files taken as prose. ``GOVERNANCE.md`` is here and its two
+#: obvious neighbours are NOT, on measurement rather than taste: 18 of the 19
+#: registered repos carrying ``SECURITY.md`` hold a BYTE-IDENTICAL 52-line
+#: copy, and ``CONTRIBUTING.md`` is the same template with the repo name
+#: substituted. The largest retrieval defect ever measured against this index
+#: was near-duplicate crowding (a ten-slot page carrying 5.93 distinct
+#: documents), so admitting eighteen copies of one file would cost ranking to
+#: buy nothing. ``GOVERNANCE.md`` exists in one repo, is unique, and is
+#: normative.
+ROOT_PROSE_FILES = ("AGENTS.md", "CLAUDE.md", "README.md", "GOVERNANCE.md")
+
+
 def _repo_root_patterns(root: Path, *, deep_docs: bool) -> Iterator[Path]:
-    """Yield the repo-root files, its ``docs/**/*.md``, and ``tasks/*.md``.
+    """Yield the repo-root files, its prose directories, and ``tasks/*.md``.
 
-    With ``deep_docs=True``, ``docs`` is matched at any depth under ``root``
-    (e.g. ``audit-api/docs/x.md`` inside a repo that nests its Python package
-    one level down), not only a top-level ``docs/`` directory, while still
-    honouring :data:`SKIP_DIR_NAMES`. This full-tree walk is only safe when
-    ``root`` is a single registered repo's own directory: :func:`os.walk`
-    cannot escape into sibling directories, so it can never reach an
-    unregistered checkout next to it.
+    With ``deep_docs=True``, a name in :data:`PROSE_DIR_NAMES` is matched at
+    any depth under ``root`` (e.g. ``audit-api/docs/x.md`` inside a repo that
+    nests its Python package one level down), not only as a top-level
+    directory, while still honouring :data:`SKIP_DIR_NAMES`. This full-tree
+    walk is only safe when ``root`` is a single registered repo's own
+    directory: :func:`os.walk` cannot escape into sibling directories, so it
+    can never reach an unregistered checkout next to it.
 
-    With ``deep_docs=False``, only a direct ``root/docs/`` subtree is walked.
-    This is what the workspace root itself must use: a full-tree walk rooted
-    at the workspace root would cross into every sibling directory (including
-    unregistered stale checkouts and other worktrees), silently reintroducing
-    the whole-workspace scan the repo registry exists to prevent.
+    With ``deep_docs=False``, only the direct ``root/<name>/`` subtrees are
+    walked. This is what the workspace root itself must use: a full-tree walk
+    rooted at the workspace root would cross into every sibling directory
+    (including unregistered stale checkouts and other worktrees), silently
+    reintroducing the whole-workspace scan the repo registry exists to prevent.
     """
-    for name in ("AGENTS.md", "CLAUDE.md", "README.md"):
+    for name in ROOT_PROSE_FILES:
         candidate = root / name
         if candidate.is_file():
             yield candidate
     if deep_docs:
         for md_path in _walk_markdown(root):
             parents = md_path.relative_to(root).parts[:-1]
-            if "docs" in parents:
+            if not PROSE_DIR_NAMES.isdisjoint(parents):
                 yield md_path
     else:
-        docs_dir = root / "docs"
-        yield from _walk_markdown(docs_dir)
+        for name in sorted(PROSE_DIR_NAMES):
+            yield from _walk_markdown(root / name)
     tasks_dir = root / "tasks"
     if tasks_dir.is_dir():
         for candidate in sorted(tasks_dir.glob("*.md")):
@@ -736,6 +773,15 @@ def rebuild_link_graph(conn) -> LinkGraphResult:
     #: and merges cleanly because the slugs differ), and the resolver must
     #: decline a citation it cannot attribute rather than pick the first.
     adr_keys: dict[str, set[int]] = {}
+    #: The same numbers bucketed by the OWNING repo. Needed because a decision
+    #: number is a repo-local identifier by construction: every repo numbers
+    #: its own records from 0001, so two repos holding a `decisions/` tree
+    #: collide on every number they both reach. That was latent until this
+    #: build started indexing `decisions/` outside the knowledge repo, and it
+    #: is not a small collision: the two overlap on ELEVEN
+    #: numbers, 0001 through 0011, which workspace-wide lookup alone would
+    #: turn into eleven silently unresolvable citations.
+    adr_repo_keys: dict[tuple[str, str], set[int]] = {}
     for row in doc_rows:
         doc_repo[row["id"]] = row["repo"]
         doc_path[row["id"]] = row["path"]
@@ -743,6 +789,7 @@ def rebuild_link_graph(conn) -> LinkGraphResult:
         number = _decision_number(row["path"])
         if number is not None:
             adr_keys.setdefault(number, set()).add(row["id"])
+            adr_repo_keys.setdefault((row["repo"], number), set()).add(row["id"])
         for key in resolution_keys(row["repo"], row["path"], row["title"]):
             repo_keys.setdefault((row["repo"], key), set()).add(row["id"])
             global_keys.setdefault(key, set()).add(row["id"])
@@ -750,24 +797,59 @@ def rebuild_link_graph(conn) -> LinkGraphResult:
     def resolve(src: int, target: str) -> tuple[int | None, bool]:
         """Return ``(doc_id, ambiguous)``; ``doc_id`` is None when nothing matched.
 
-        The same-repo bucket is tried before the workspace-wide one, but that
-        ordering is INERT and kept for readability rather than effect: the
-        repo bucket is a subset of the global one, so a single same-repo
-        candidate is always also the single global candidate, and a global
-        bucket with two entries is rejected by the ambiguity rule before the
-        order could matter. Swapping the two changes no outcome, confirmed by
-        mutation. The documented preference is real as behaviour and is
-        delivered by the ambiguity rule; do not "repair" it into an actual
-        precedence, which would let a same-repo name win a contest the
-        resolver currently declines.
+        THE TWO LOOKUPS BELOW DIFFER, and the difference is deliberate.
+
+        For a NAME (filename or title), the same-repo bucket is tried before
+        the workspace-wide one, but that ordering is INERT and kept for
+        readability rather than effect: the repo bucket is a subset of the
+        global one, so a single same-repo candidate is always also the single
+        global candidate, and a global bucket with two entries is rejected by
+        the ambiguity rule before the order could matter. Swapping the two
+        changes no outcome, confirmed by mutation. The documented preference is
+        real as behaviour and is delivered by the ambiguity rule; do not
+        "repair" it into an actual precedence, which would let a same-repo name
+        win a contest the resolver currently declines.
+
+        For a decision NUMBER the same shape is a REAL precedence, because the
+        premise that makes the name version inert does not hold. A number is a
+        repo-local identifier: every repo numbers its records from 0001, so a
+        collision between repos is the normal case rather than the accident it
+        is for names. "decision 0006" written in one repo's document means
+        that repo's 0006, and no ambiguity rule can discover that, because
+        both candidates are equally good workspace-wide. Declining is the wrong
+        answer here where it is the right one for names.
+
+        The workspace-wide fallback stays, and is load-bearing rather than
+        vestigial: the workspace root and the skills directory hold no
+        `decisions/` of their own, so every decision citation they make can
+        only be answered globally.
+
+        Note the shape of the repo branch, and note what is NOT claimed for it.
+        A repo bucket holding two records returns ambiguous rather than falling
+        through, because two records taking one number INSIDE one repo is the
+        collision the resolver must still decline; that has happened three
+        times here. But that early return is EQUIVALENT to falling through
+        today, by construction rather than by luck: the repo bucket is a subset
+        of the global one, so a repo bucket with two entries guarantees a
+        global bucket with at least those two, which the same rule rejects.
+        Confirmed by mutation, and no fixture can separate the two branches.
+
+        It is written explicitly anyway, for the same reason the name lookup
+        documents its inert ordering: the equivalence is a property of there
+        being exactly two buckets in a subset relation, and it would stop
+        holding the moment a third lookup, or a narrowing of the global bucket,
+        was added between them. What must not happen is someone reading the
+        early return as tested behaviour; it is not, and cannot be.
         """
         if _ADR_NUMBER_RE.fullmatch(target):
-            candidates = adr_keys.get(target)
-            if not candidates:
-                return None, False
-            if len(candidates) > 1:
-                return None, True
-            return next(iter(candidates)), False
+            src_repo = doc_repo.get(src, "")
+            for candidates in (adr_repo_keys.get((src_repo, target)), adr_keys.get(target)):
+                if not candidates:
+                    continue
+                if len(candidates) > 1:
+                    return None, True
+                return next(iter(candidates)), False
+            return None, False
         relative = resolve_relative_path(doc_path.get(src, ""), target)
         if relative is not None:
             # Unambiguous by construction, so a miss here is a miss: falling
@@ -887,7 +969,31 @@ def reindex(
         # until a complete replacement exists, so a concurrent reader cannot
         # observe an empty half-built index and a failed run cannot leave one
         # behind. Incremental runs against a current index write directly.
-        rebuilding = full or not _index_is_current(resolved_db_path)
+        # The model name is resolved here, not inside the pass, because the
+        # decision it feeds (rebuild into a scratch file, or write in place)
+        # has to be made before the first write. Reading it costs nothing: an
+        # embedder's model comes from configuration, not from the backend.
+        active_model = getattr(embedder, "model", None) if embedder is not None else None
+        if active_model is None:
+            active_model = default_embedder().model
+        # Sampled where the decision happens. Re-deriving the reason after the
+        # swap would read the NEW index, whose stored model already matches,
+        # so the very condition that caused the rebuild is gone by then.
+        rebuild_reason: str | None = None
+        if full:
+            rebuild_reason = "a full rebuild was requested"
+        elif not _index_is_current(resolved_db_path):
+            rebuild_reason = "the existing index cannot be updated incrementally by this build"
+        else:
+            stored_model = db.stored_meta(resolved_db_path, db.META_EMBED_MODEL)
+            if _model_change_needs_a_rebuild(
+                resolved_db_path, embedder=embedder, active_model=active_model
+            ):
+                rebuild_reason = (
+                    f"the embedding model changed from {stored_model!r} to "
+                    f"{active_model!r}, so every vector has to be recomputed"
+                )
+        rebuilding = rebuild_reason is not None
         work_path = Path(f"{resolved_db_path}.rebuild") if rebuilding else resolved_db_path
         if rebuilding:
             db.discard_index(work_path)
@@ -907,6 +1013,8 @@ def reindex(
         if rebuilding:
             db.swap_index(work_path, resolved_db_path)
 
+    stats.rebuilt = rebuilding
+    stats.rebuild_reason = rebuild_reason
     stats.duration_seconds = time.monotonic() - start
     return stats
 
@@ -954,6 +1062,42 @@ def _index_is_current(db_path: Path) -> bool:
     # correct: its targets were written by an extractor whose version is
     # unknown, so it cannot be assumed to match.
     return stored_extractor == str(EXTRACTOR_VERSION)
+
+
+def _model_change_needs_a_rebuild(
+    db_path: Path, *, embedder, active_model: str | None
+) -> bool:
+    """True when the embedding model changed AND the backend can refill a replacement.
+
+    The model change alone is the case issue #55 is about. Updating in place
+    means emptying the vector table, or dropping and recreating it at a new
+    width, and then refilling it over the length of a whole embedding run.
+    Readers take no lock, so anyone querying inside that window gets a
+    lexical-only page from an index that could have answered fully. Routed
+    through rebuild-and-swap instead, the live index is untouched until a
+    complete replacement exists.
+
+    **Both halves are required, and the second is not caution.** A rebuild
+    ends in a swap, so it is only an improvement if the replacement will be
+    complete. With the backend unreachable the scratch index is built with no
+    vectors at all, and the swap would then replace every usable vector with
+    none: strictly worse than the in-place path, where the existing guard
+    keeps the old vectors and defers the invalidation to a healthy run. So the
+    backend is asked whether it is there before this promises a replacement.
+
+    The MODEL NAME is the observable, deliberately, not the width. A width
+    change under an unchanged name means the backend served two widths for one
+    model, which the embedder already rejects mid-run. Absence on either side
+    stays unknown rather than becoming a mismatch, per db.stale_embed_model.
+    """
+    stored_model = db.stored_meta(db_path, db.META_EMBED_MODEL)
+    if db.stale_embed_model(stored_model, active_model) is None:
+        return False
+    try:
+        (embedder or default_embedder()).probe()
+    except EmbeddingUnavailable:
+        return False
+    return True
 
 
 def _run_indexing_pass(
