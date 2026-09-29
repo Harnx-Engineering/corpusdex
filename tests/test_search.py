@@ -1,0 +1,1199 @@
+from __future__ import annotations
+
+import time
+
+import pytest
+
+from corpusdex import db, search
+
+
+def _insert_doc_with_chunk(
+    conn,
+    *,
+    path: str,
+    body: str,
+    heading_path: str = "Title > Section",
+    decided_on: str | None = None,
+    superseded_by: str | None = None,
+    superseded_by_doc_id: int | None = None,
+    mtime: float | None = None,
+) -> int:
+    """Insert one document with one chunk; return the CHUNK id.
+
+    ``superseded_by`` writes the raw frontmatter string, which is what the
+    result payload displays. ``superseded_by_doc_id`` writes the resolved
+    ``doc_links`` edge, which is what the ranking penalty reads. They are
+    separate parameters on purpose: keeping them separable is what lets a
+    test pin the case where a record claims supersedence that resolved to
+    nothing (issue #21).
+    """
+    if mtime is None:
+        mtime = time.time()
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO documents (repo, path, title, doc_type, mtime, content_hash) "
+            "VALUES ('repo', ?, 'Title', 'doc', ?, ?)",
+            (path, mtime, f"hash-{path}"),
+        )
+        doc_id = cur.lastrowid
+        chunk_cur = conn.execute(
+            "INSERT INTO chunks (ref, doc_id, heading_path, body, decided_on, superseded_by) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                db.chunk_ref(path, heading_path, 0),
+                doc_id,
+                heading_path,
+                body,
+                decided_on,
+                superseded_by,
+            ),
+        )
+        if superseded_by_doc_id is not None:
+            conn.execute(
+                "INSERT INTO doc_links (src_doc_id, dst_doc_id, relation) VALUES (?, ?, ?)",
+                (doc_id, superseded_by_doc_id, "superseded_by"),
+            )
+    return chunk_cur.lastrowid
+
+
+def _doc_id_of(conn, path: str) -> int:
+    return conn.execute("SELECT id FROM documents WHERE path = ?", (path,)).fetchone()["id"]
+
+
+def _insert_vector(conn, chunk_id: int, value: float = 0.1) -> None:
+    import sqlite_vec
+
+    with conn:
+        conn.execute(
+            "INSERT INTO vec_chunks (chunk_id, embedding) VALUES (?, ?)",
+            (chunk_id, sqlite_vec.serialize_float32([value] * db.EMBED_DIM)),
+        )
+
+
+# ---------------------------------------------------------------------------
+# RRF fusion math
+# ---------------------------------------------------------------------------
+
+
+def test_fuse_reciprocal_rank_math():
+    lexical = [10, 20, 30]
+    vector = [20, 30, 40]
+    fused = search._fuse(lexical, vector)
+
+    k = search.RRF_K
+    assert fused[10] == pytest.approx(1 / (k + 1))
+    assert fused[20] == pytest.approx(1 / (k + 2) + 1 / (k + 1))
+    assert fused[30] == pytest.approx(1 / (k + 3) + 1 / (k + 2))
+    assert fused[40] == pytest.approx(1 / (k + 3))
+
+
+def test_fuse_empty_lists_produce_no_scores():
+    assert search._fuse([], []) == {}
+
+
+def test_fuse_single_list_is_just_reciprocal_rank():
+    fused = search._fuse([5, 6, 7])
+    k = search.RRF_K
+    assert fused == {
+        5: pytest.approx(1 / (k + 1)),
+        6: pytest.approx(1 / (k + 2)),
+        7: pytest.approx(1 / (k + 3)),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Recency boost + supersedence penalty
+# ---------------------------------------------------------------------------
+
+
+def test_recency_factor_is_one_for_today():
+    import datetime as dt
+
+    # UTC, matching _recency_factor's own "today" reference point: using the
+    # local date here would be flaky near a UTC day boundary in timezones
+    # ahead or behind UTC.
+    today = dt.datetime.now(dt.UTC).date().isoformat()
+    assert search._recency_factor(today, mtime=0.0) == pytest.approx(1.0)
+
+
+def test_recency_factor_decays_with_age():
+    import datetime as dt
+
+    today_utc = dt.datetime.now(dt.UTC).date()
+    old = (today_utc - dt.timedelta(days=int(search.RECENCY_HALFLIFE_DAYS))).isoformat()
+    factor = search._recency_factor(old, mtime=0.0)
+    assert factor == pytest.approx(0.5, rel=1e-2)
+
+
+def test_recency_factor_falls_back_to_mtime_when_no_decided_on():
+    import datetime as dt
+
+    today_mtime = dt.datetime.now(dt.UTC).timestamp()
+    factor = search._recency_factor(None, mtime=today_mtime)
+    assert factor == pytest.approx(1.0, rel=1e-3)
+
+
+def test_apply_boosts_downranks_superseded_chunk(lexical_conn):
+    same_time = time.time()
+    active_id = _insert_doc_with_chunk(
+        lexical_conn, path="active.md", body="the active fact", mtime=same_time
+    )
+    superseded_id = _insert_doc_with_chunk(
+        lexical_conn,
+        path="superseded.md",
+        body="the superseded fact",
+        superseded_by="active.md#active-fact",
+        superseded_by_doc_id=_doc_id_of(lexical_conn, "active.md"),
+        mtime=same_time,
+    )
+
+    # Equal base RRF scores: only supersedence should differentiate them.
+    boosted = search._apply_boosts(lexical_conn, {active_id: 1.0, superseded_id: 1.0})
+
+    active_score = boosted[active_id][0]
+    superseded_score = boosted[superseded_id][0]
+    assert superseded_score == pytest.approx(active_score * search.SUPERSEDED_PENALTY)
+    assert superseded_score < active_score
+
+
+def test_search_ranks_superseded_chunk_below_its_replacement(lexical_conn):
+    same_time = time.time()
+    _insert_doc_with_chunk(
+        lexical_conn,
+        path="active.md",
+        body="cache invalidation rules applies here",
+        mtime=same_time,
+    )
+    _insert_doc_with_chunk(
+        lexical_conn,
+        path="superseded.md",
+        body="cache invalidation rules applies here too",
+        superseded_by="active.md",
+        superseded_by_doc_id=_doc_id_of(lexical_conn, "active.md"),
+        mtime=same_time,
+    )
+
+    response = search.search(lexical_conn, vec_ok=False, query="cache invalidation rules")
+    assert len(response.hits) == 2
+    assert response.hits[0].path == "active.md"
+    assert response.hits[1].path == "superseded.md"
+    assert response.hits[0].score > response.hits[1].score
+
+
+def test_supersedence_penalty_needs_the_edge_not_the_frontmatter_string(lexical_conn):
+    """A superseded_by that resolved to nothing must not bury the document.
+
+    This is issue #21. The penalty used to key on the raw frontmatter string,
+    while the successor shown alongside the hit comes from the resolved
+    ``doc_links`` edge, so a value naming no document dropped the record by 70
+    percent while displaying no successor and raising no error. The two now
+    read the same edge, so they cannot disagree.
+    """
+    same_time = time.time()
+    active_id = _insert_doc_with_chunk(
+        lexical_conn, path="active.md", body="the active fact", mtime=same_time
+    )
+    dangling_id = _insert_doc_with_chunk(
+        lexical_conn,
+        path="dangling.md",
+        body="the dangling fact",
+        # Names a document that is not in the corpus, so no edge was written.
+        superseded_by="a-document-that-does-not-exist.md",
+        mtime=same_time,
+    )
+
+    boosted = search._apply_boosts(lexical_conn, {active_id: 1.0, dangling_id: 1.0})
+
+    assert boosted[dangling_id][0] == pytest.approx(boosted[active_id][0])
+
+
+def test_a_resolved_edge_penalises_even_with_no_frontmatter_string(lexical_conn):
+    """The mirror direction: the edge alone is sufficient to penalise.
+
+    Asserted separately from the test above because a mutation that made the
+    penalty read ``superseded_by AND the edge`` would satisfy that one and
+    still be wrong here.
+    """
+    same_time = time.time()
+    active_id = _insert_doc_with_chunk(
+        lexical_conn, path="active.md", body="the active fact", mtime=same_time
+    )
+    superseded_id = _insert_doc_with_chunk(
+        lexical_conn,
+        path="superseded.md",
+        body="the superseded fact",
+        superseded_by=None,
+        superseded_by_doc_id=_doc_id_of(lexical_conn, "active.md"),
+        mtime=same_time,
+    )
+
+    boosted = search._apply_boosts(lexical_conn, {active_id: 1.0, superseded_id: 1.0})
+
+    assert boosted[superseded_id][0] == pytest.approx(
+        boosted[active_id][0] * search.SUPERSEDED_PENALTY
+    )
+
+
+def test_an_unrelated_outgoing_link_does_not_count_as_supersedence(lexical_conn):
+    """Only the ``superseded_by`` relation penalises, not any edge at all.
+
+    The penalty is an EXISTS over ``doc_links`` filtered by relation. Without
+    the filter every document that links to anything would be treated as
+    replaced, which is most of the corpus.
+    """
+    same_time = time.time()
+    active_id = _insert_doc_with_chunk(
+        lexical_conn, path="active.md", body="the active fact", mtime=same_time
+    )
+    linking_id = _insert_doc_with_chunk(
+        lexical_conn, path="linking.md", body="the linking fact", mtime=same_time
+    )
+    with lexical_conn:
+        lexical_conn.execute(
+            "INSERT INTO doc_links (src_doc_id, dst_doc_id, relation) VALUES (?, ?, ?)",
+            (
+                _doc_id_of(lexical_conn, "linking.md"),
+                _doc_id_of(lexical_conn, "active.md"),
+                "links_to",
+            ),
+        )
+
+    boosted = search._apply_boosts(lexical_conn, {active_id: 1.0, linking_id: 1.0})
+
+    assert boosted[linking_id][0] == pytest.approx(boosted[active_id][0])
+
+
+def test_being_the_target_of_supersedence_does_not_penalise_the_successor(lexical_conn):
+    """The replacement must not be demoted by the edge that points AT it.
+
+    The EXISTS matches on ``src_doc_id``. Keying it on ``dst_doc_id`` instead
+    would invert the feature exactly, promoting the retired record over the
+    one that replaced it, and every assertion above would still pass because
+    in those the pair differs on both ends at once.
+    """
+    same_time = time.time()
+    active_id = _insert_doc_with_chunk(
+        lexical_conn, path="active.md", body="the active fact", mtime=same_time
+    )
+    neutral_id = _insert_doc_with_chunk(
+        lexical_conn, path="neutral.md", body="the neutral fact", mtime=same_time
+    )
+    _insert_doc_with_chunk(
+        lexical_conn,
+        path="superseded.md",
+        body="the superseded fact",
+        superseded_by="active.md",
+        superseded_by_doc_id=_doc_id_of(lexical_conn, "active.md"),
+        mtime=same_time,
+    )
+
+    boosted = search._apply_boosts(lexical_conn, {active_id: 1.0, neutral_id: 1.0})
+
+    assert boosted[active_id][0] == pytest.approx(boosted[neutral_id][0])
+
+
+# ---------------------------------------------------------------------------
+# Degraded mode, and the mode label that reports it
+# ---------------------------------------------------------------------------
+
+
+def test_search_degrades_when_vec_ok_is_false(lexical_conn):
+    _insert_doc_with_chunk(lexical_conn, path="a.md", body="findable content about widgets")
+
+    response = search.search(lexical_conn, vec_ok=False, query="widgets")
+
+    assert response.degraded is True
+    assert response.degraded_reason == "sqlite-vec extension not loaded"
+    assert response.mode == db.MODE_LEXICAL
+    assert len(response.hits) == 1
+    assert response.hits[0].path == "a.md"
+
+
+def test_search_degrades_when_vec_ok_but_no_vec_table(lexical_conn, stub_embedder):
+    # vec_ok=True but the connection's schema was created with vec=False, so
+    # db.has_vec_table(conn) is False: the vector path must be skipped and
+    # the response must say degraded, not silently error.
+    _insert_doc_with_chunk(lexical_conn, path="a.md", body="findable content about sprockets")
+
+    response = search.search(lexical_conn, vec_ok=True, query="sprockets", embedder=stub_embedder)
+
+    assert response.degraded is True
+    assert response.degraded_reason == "vector table not present"
+    assert response.mode == db.MODE_LEXICAL
+    assert len(response.hits) == 1
+
+
+def test_search_degrades_when_zero_chunks_embedded(vec_conn):
+    # The vector table exists (backend previously loaded, e.g. the index was
+    # built while Ollama was down) but nothing has been embedded into it yet.
+    # Table existence alone must not read as "not degraded": coverage is what
+    # decides it, so this must degrade with a backfill-pointing reason.
+    _insert_doc_with_chunk(vec_conn, path="a.md", body="findable content about thingamajigs")
+
+    response = search.search(vec_conn, vec_ok=True, query="thingamajigs")
+
+    assert response.degraded is True
+    assert "0 chunks are embedded" in response.degraded_reason
+    assert response.mode == db.MODE_LEXICAL
+    assert len(response.hits) == 1
+
+
+def test_search_degrades_when_embedder_raises(vec_conn, failing_embedder):
+    # At least one chunk is embedded (so the zero-coverage branch is not what
+    # trips this), but the query-time embed call itself fails: this is the
+    # backend-down-mid-query case.
+    chunk_id = _insert_doc_with_chunk(vec_conn, path="a.md", body="findable content about gadgets")
+    _insert_vector(vec_conn, chunk_id)
+
+    response = search.search(vec_conn, vec_ok=True, query="gadgets", embedder=failing_embedder)
+
+    assert response.degraded is True
+    assert response.degraded_reason.startswith("embedding backend unavailable")
+    assert response.mode == db.MODE_LEXICAL
+    assert len(response.hits) == 1
+    assert response.hits[0].path == "a.md"
+
+
+def test_search_against_a_hung_backend_degrades_within_the_query_budget(vec_conn):
+    """Issue #68 end to end: a wedged Ollama must not hold `brain search` for 120s.
+
+    A REAL OllamaEmbedder against a socket that accepts and never answers, so
+    the path under test is the one a person hits. The indexing timeout is set
+    to 30s: a search routed through it would blow the elapsed bound. One chunk
+    is embedded and no model name is stored, so neither the zero-coverage nor
+    the model-mismatch gate stops the search before the query embed runs.
+    """
+    import socket
+    import threading
+
+    from corpusdex.embedder import OllamaEmbedder
+
+    chunk_id = _insert_doc_with_chunk(vec_conn, path="a.md", body="findable content about gizmos")
+    _insert_vector(vec_conn, chunk_id)
+
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(8)
+    held: list[socket.socket] = []
+    stop = threading.Event()
+
+    def hold() -> None:
+        listener.settimeout(0.1)
+        while not stop.is_set():
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                continue
+            held.append(conn)
+
+    thread = threading.Thread(target=hold, daemon=True)
+    thread.start()
+    try:
+        host = f"http://127.0.0.1:{listener.getsockname()[1]}"
+        embedder = OllamaEmbedder(host=host, timeout=30.0, query_timeout=0.4)
+        start = time.monotonic()
+        response = search.search(vec_conn, vec_ok=True, query="gizmos", embedder=embedder)
+        elapsed = time.monotonic() - start
+    finally:
+        stop.set()
+        thread.join()
+        for conn in held:
+            conn.close()
+        listener.close()
+
+    assert held, "the query embed never reached the hung backend"
+    assert elapsed < 5.0, f"search took {elapsed:.2f}s"
+    assert response.degraded is True
+    assert "sent no response" in response.degraded_reason
+    assert [h.path for h in response.hits] == ["a.md"]
+
+
+def test_search_not_degraded_when_backend_and_vectors_available(vec_conn, stub_embedder):
+    chunk_id = _insert_doc_with_chunk(vec_conn, path="a.md", body="findable content about widgets")
+    _insert_vector(vec_conn, chunk_id)
+
+    response = search.search(vec_conn, vec_ok=True, query="widgets", embedder=stub_embedder)
+
+    assert response.degraded is False
+    assert response.degraded_reason is None
+    assert response.mode == db.MODE_LEXICAL_VECTOR
+    assert len(response.hits) == 1
+
+
+def test_search_empty_query_returns_no_hits(lexical_conn):
+    _insert_doc_with_chunk(lexical_conn, path="a.md", body="anything at all")
+    response = search.search(lexical_conn, vec_ok=False, query="   ")
+    assert response.hits == []
+    # No channel ran, so no channel can be named. MODE_LEXICAL here would be
+    # the same false claim as the degraded case: a label asserting that a
+    # particular channel produced the page when none did.
+    assert response.channels_used == frozenset()
+    assert response.mode == db.MODE_NONE
+
+
+def test_narrowed_channels_are_not_reported_as_hybrid(vec_conn, stub_embedder):
+    # The second instance of issue #13, in the opposite direction and never
+    # filed: with the vector channel simply not requested, nothing has failed,
+    # so `degraded` is correctly False. Deriving the label from `degraded`
+    # therefore announced `hybrid` for a page that only the lexical channel
+    # produced. Availability and participation are different questions.
+    chunk_id = _insert_doc_with_chunk(vec_conn, path="a.md", body="findable content about widgets")
+    _insert_vector(vec_conn, chunk_id)
+
+    response = search.search(
+        vec_conn,
+        vec_ok=True,
+        query="widgets",
+        embedder=stub_embedder,
+        channels={search.CHANNEL_LEXICAL},
+    )
+
+    assert response.degraded is False
+    assert response.channels_used == frozenset({search.CHANNEL_LEXICAL})
+    assert response.mode == db.MODE_LEXICAL
+
+
+def test_mode_is_derived_from_channels_used_and_cannot_contradict_it(
+    vec_conn, stub_embedder, failing_embedder
+):
+    # The invariant, pinned across every state reachable here rather than at
+    # one point: whatever `channels_used` says, `mode` is its summary. A label
+    # computed independently is free to drift from it, which is how the two
+    # fields disagreed in the first place.
+    chunk_id = _insert_doc_with_chunk(vec_conn, path="a.md", body="findable content about widgets")
+    _insert_vector(vec_conn, chunk_id)
+
+    def mode_of(**kwargs):
+        response = search.search(vec_conn, vec_ok=True, query="widgets", **kwargs)
+        return response.mode, response.channels_used
+
+    observed = [
+        mode_of(embedder=stub_embedder),
+        mode_of(embedder=failing_embedder),
+        mode_of(embedder=stub_embedder, channels={search.CHANNEL_LEXICAL}),
+        mode_of(embedder=stub_embedder, channels={search.CHANNEL_VECTOR}),
+    ]
+    # Rendering, not a lookup table: the assertion is that the label is the
+    # channel set spelled out, which holds for the narrow sets a caller can
+    # ask for as much as for the two production shapes. A table would have to
+    # be extended for every new subset, and the entry nobody added is exactly
+    # where the old two-value form went wrong.
+    for mode, used in observed:
+        assert mode == "+".join(c for c in search.CHANNEL_ORDER if c in used) or (
+            mode == db.MODE_NONE and not used
+        )
+    modes = [mode for mode, _ in observed]
+    assert modes == [
+        db.MODE_LEXICAL_VECTOR,
+        db.MODE_LEXICAL,
+        db.MODE_LEXICAL,
+        "vector",
+    ]
+
+
+def test_fts_match_query_escapes_punctuation(lexical_conn):
+    _insert_doc_with_chunk(
+        lexical_conn, path="a.md", body="cache invalidation rules: do not reintroduce"
+    )
+    # Punctuation and quote characters must not break the MATCH expression.
+    response = search.search(lexical_conn, vec_ok=False, query='cache-invalidation "rules"?!')
+    assert len(response.hits) == 1
+
+
+# ---------------------------------------------------------------------------
+# get_chunk / recent
+# ---------------------------------------------------------------------------
+
+
+def test_get_chunk_returns_full_body(lexical_conn):
+    _insert_doc_with_chunk(lexical_conn, path="a.md", body="the full body text")
+    hit = search.get_chunk(lexical_conn, db.chunk_ref("a.md", "Title > Section", 0))
+    assert hit is not None
+    assert hit.body == "the full body text"
+    assert hit.citation == "a.md#Title > Section"
+    assert hit.ref == db.chunk_ref("a.md", "Title > Section", 0)
+
+
+def test_get_chunk_missing_ref_returns_none(lexical_conn):
+    assert search.get_chunk(lexical_conn, "cdeadbeefdeadbeef") is None
+
+
+def test_get_chunk_does_not_accept_a_rowid(lexical_conn):
+    """A rowid must not resolve, even when it names a real row.
+
+    This is the whole point of issue #23: an agent that kept an id from an
+    older search must get a miss, not the row that now happens to occupy
+    that id.
+    """
+    chunk_id = _insert_doc_with_chunk(lexical_conn, path="a.md", body="the full body text")
+    assert search.get_chunk(lexical_conn, str(chunk_id)) is None
+
+
+def test_chunk_ref_survives_a_rowid_reassignment(lexical_conn):
+    """The ref keeps naming its section after the row is deleted and rebuilt.
+
+    Simulates what reindex does to a changed document: the chunk rows are
+    deleted and reinserted, so every rowid moves. The ref is unchanged and
+    still resolves to the same section, now carrying the updated body.
+    """
+    original_id = _insert_doc_with_chunk(lexical_conn, path="a.md", body="original body")
+    ref = db.chunk_ref("a.md", "Title > Section", 0)
+    assert search.get_chunk(lexical_conn, ref).body == "original body"
+
+    with lexical_conn:
+        doc_id = lexical_conn.execute("SELECT doc_id FROM chunks WHERE ref = ?", (ref,)).fetchone()[
+            "doc_id"
+        ]
+        lexical_conn.execute("DELETE FROM chunks WHERE ref = ?", (ref,))
+        # A different document's chunk lands first and takes the freed rowid.
+        lexical_conn.execute(
+            "INSERT INTO chunks (ref, doc_id, heading_path, body) VALUES (?, ?, ?, ?)",
+            (db.chunk_ref("a.md", "Title > Other", 0), doc_id, "Title > Other", "unrelated"),
+        )
+        lexical_conn.execute(
+            "INSERT INTO chunks (ref, doc_id, heading_path, body) VALUES (?, ?, ?, ?)",
+            (ref, doc_id, "Title > Section", "edited body"),
+        )
+
+    rebuilt = search.get_chunk(lexical_conn, ref)
+    assert rebuilt is not None
+    assert rebuilt.body == "edited body"
+    assert rebuilt.heading_path == "Title > Section"
+    # The rowid moved, which is exactly why it cannot be the durable handle.
+    assert rebuilt.chunk_id != original_id
+
+
+def test_repeated_heading_paths_in_one_document_get_distinct_refs():
+    """Two identically titled sections must not collide on one ref.
+
+    The ordinal disambiguates them, and it counts occurrences of the same
+    heading path rather than position in the document, so adding an unrelated
+    section does not renumber either of these.
+    """
+    first = db.chunk_ref("a.md", "Title > Notes", 0)
+    second = db.chunk_ref("a.md", "Title > Notes", 1)
+    assert first != second
+    assert db.chunk_ref("a.md", "Title > Notes", 0) == first
+
+
+def test_refs_are_scoped_to_their_document():
+    """The same heading path in two documents must produce different refs."""
+    assert db.chunk_ref("a.md", "Title > Section", 0) != db.chunk_ref("b.md", "Title > Section", 0)
+
+
+def test_chunk_ref_never_parses_as_an_integer():
+    """The prefix is load-bearing: a ref must not be mistakable for a rowid."""
+    ref = db.chunk_ref("a.md", "Title > Section", 0)
+    assert ref.startswith(db.CHUNK_REF_PREFIX)
+    with pytest.raises(ValueError):
+        int(ref)
+
+
+def test_recent_orders_by_document_mtime_desc(lexical_conn):
+    _insert_doc_with_chunk(lexical_conn, path="older.md", body="old content", mtime=100.0)
+    _insert_doc_with_chunk(lexical_conn, path="newer.md", body="new content", mtime=200.0)
+
+    hits = search.recent(lexical_conn, limit=10)
+    assert [h.path for h in hits] == ["newer.md", "older.md"]
+
+
+# ---------------------------------------------------------------------------
+# One chunk per document
+# ---------------------------------------------------------------------------
+
+
+def _insert_doc_with_chunks(conn, *, path: str, bodies: list[str]) -> int:
+    """Insert one document carrying several chunks, all under distinct headings."""
+    with conn:
+        cur = conn.execute(
+            "INSERT INTO documents (repo, path, title, doc_type, mtime, content_hash) "
+            "VALUES ('repo', ?, 'Title', 'doc', ?, ?)",
+            (path, time.time(), f"hash-{path}"),
+        )
+        doc_id = cur.lastrowid
+        for ordinal, body in enumerate(bodies):
+            heading = f"Title > Section {ordinal}"
+            conn.execute(
+                "INSERT INTO chunks (ref, doc_id, heading_path, body) VALUES (?, ?, ?, ?)",
+                (db.chunk_ref(path, heading, ordinal), doc_id, heading, body),
+            )
+    return doc_id
+
+
+def test_search_returns_at_most_one_chunk_per_document(lexical_conn):
+    """A single document must not occupy every slot with its own sections.
+
+    Relevance is judged, cited and read per document, so a page of near-identical
+    sections from one document spends the caller's slot budget without adding an
+    answer. Measured before this rule existed: a 10-slot page carried a mean of
+    5.93 distinct documents across the judged set, and one query returned ten
+    chunks of a single document.
+    """
+    crowder = _insert_doc_with_chunks(
+        conn=lexical_conn,
+        path="crowder.md",
+        bodies=["quorum quorum quorum alpha"] * 4,
+    )
+    other = _insert_doc_with_chunks(
+        conn=lexical_conn,
+        path="other.md",
+        bodies=["quorum beta"],
+    )
+
+    response = search.search(lexical_conn, False, "quorum", limit=2)
+
+    doc_ids = [hit.doc_id for hit in response.hits]
+    assert len(doc_ids) == len(set(doc_ids)), "a document appeared twice in one page"
+    assert set(doc_ids) == {crowder, other}, (
+        "the crowding document should keep only its best chunk, leaving room for "
+        "the other document rather than filling both slots"
+    )
+
+
+def test_search_keeps_the_best_scoring_chunk_of_a_document(lexical_conn):
+    """Deduplication must not change which chunk represents a document.
+
+    The list is already in final ranked order when duplicates are dropped, so the
+    survivor is the highest scoring chunk. A survivor chosen by insertion order
+    instead would silently return a weaker section than the ranking selected.
+    """
+    _insert_doc_with_chunks(
+        conn=lexical_conn,
+        path="doc.md",
+        bodies=["gamma unrelated filler text here", "gamma gamma gamma gamma"],
+    )
+
+    response = search.search(lexical_conn, False, "gamma", limit=5)
+
+    assert len(response.hits) == 1
+    assert response.hits[0].body == "gamma gamma gamma gamma"
+
+
+# ---------------------------------------------------------------------------
+# The graph channel votes at a discount, because it is derived (issue #17)
+#
+# It is seeded from the fused lexical+vector head, so a full peer vote counts
+# the base ranking's own opinion twice and lets the derived channel outrank
+# its own source. Measured: seven queries whose answer the base already had at
+# rank 1 were pushed down, every one of them with a recall delta of zero.
+# ---------------------------------------------------------------------------
+
+
+def test_fuse_applies_a_per_list_weight():
+    fused = search._fuse([1], [2], weights=(1.0, 0.25))
+    assert fused[1] == pytest.approx(1.0 / (search.RRF_K + 1))
+    assert fused[2] == pytest.approx(0.25 / (search.RRF_K + 1))
+
+
+def test_fuse_is_unweighted_by_default():
+    """The default must stay one vote per list.
+
+    `base_fused`, the ranking the graph channel is seeded from, calls _fuse
+    without weights and must not be discounted by this change.
+    """
+    assert search._fuse([1], [2]) == search._fuse([1], [2], weights=(1.0, 1.0))
+
+
+def test_fuse_rejects_a_weight_count_that_does_not_match():
+    """Silently padding or truncating would discount the wrong channel.
+
+    A mismatch means the caller's idea of the channel order has drifted from
+    the argument order, and guessing which list lost its weight is exactly the
+    kind of quiet misranking this whole constant exists to prevent.
+    """
+    with pytest.raises(ValueError, match="2 ranked lists but 3 weights"):
+        search._fuse([1], [2], weights=(1.0, 1.0, 1.0))
+
+
+def test_a_weighted_graph_vote_cannot_tie_the_lexical_top_hit(lexical_conn):
+    """The concrete displacement the weight prevents.
+
+    A document found ONLY by the graph channel, at graph rank 1, scores
+    ``w/(RRF_K+1)``. The lexical top hit scores ``1/(RRF_K+1)``. At a full
+    vote those are EQUAL and the winner is decided by the tiebreak, so a
+    document the query does not match can take rank 1 from one that does.
+    """
+    top = search._fuse(["lexical-top"], weights=(1.0,))["lexical-top"]
+    graph_only = search._fuse(["graph-only"], weights=(search.GRAPH_VOTE_WEIGHT,))[
+        "graph-only"
+    ]
+    assert graph_only < top
+    assert graph_only == pytest.approx(top * search.GRAPH_VOTE_WEIGHT)
+
+
+def test_search_gives_the_graph_list_the_discounted_weight(lexical_conn, monkeypatch):
+    """Pins the wiring: the discount must reach the GRAPH list specifically.
+
+    Asserted at the seam rather than through scores because a weight applied
+    to the wrong list, or dropped on the way, produces a ranking that is
+    merely different rather than obviously wrong, and no score assertion
+    distinguishes those cases from a corpus change.
+    """
+    _insert_doc_with_chunk(lexical_conn, path="a.md", body="cache invalidation rules")
+    seen: list[tuple[float, ...] | None] = []
+    real_fuse = search._fuse
+
+    def spy(*ranked_lists, weights=None):
+        seen.append(weights)
+        return real_fuse(*ranked_lists, weights=weights)
+
+    monkeypatch.setattr(search, "_fuse", spy)
+    search.search(lexical_conn, vec_ok=False, query="cache invalidation rules")
+
+    # The first call is base_fused (unweighted, it is the thing being seeded
+    # from); the final call is the one the ranking is built on.
+    assert seen[0] is None
+    assert seen[-1] == (1.0, 1.0, search.GRAPH_VOTE_WEIGHT)
+
+
+def test_a_model_of_another_width_degrades_instead_of_raising(vec_conn, stub_embedder):
+    """Switching to a narrower model without reindexing must degrade, not
+    crash.
+
+    The embedder learns its width from the model now, so nothing upstream
+    rejects the mismatched query vector; vec0 answers it with
+    sqlite3.OperationalError, which no caller catches and which is not in
+    cli._CLEAN_ERRORS, so the CLI printed a traceback. The pre-#15 code was
+    accidentally safe here because the pinned width made the embedder raise
+    EmbeddingUnavailable first.
+    """
+    from conftest import StubEmbedder
+
+    chunk_id = _insert_doc_with_chunk(vec_conn, path="a.md", body="findable content about widgets")
+    _insert_vector(vec_conn, chunk_id)
+    assert db.vec_table_dim(vec_conn) == db.EMBED_DIM
+
+    narrow = StubEmbedder(dim=384, model="narrow-model")
+    response = search.search(vec_conn, vec_ok=True, query="widgets", embedder=narrow)
+
+    assert response.degraded is True
+    assert str(db.EMBED_DIM) in response.degraded_reason
+    assert "384" in response.degraded_reason
+    assert "reindex" in response.degraded_reason
+    # Degraded is not empty: the lexical channel still answers the query.
+    assert len(response.hits) == 1
+    assert response.channels_used == frozenset({search.CHANNEL_LEXICAL})
+
+
+def test_a_model_of_the_same_width_degrades_because_its_vectors_are_incomparable(vec_conn):
+    """The width check cannot see this one, and it is the worse failure.
+
+    Two models of the same width produce vectors in unrelated spaces. Cosine
+    distance between them is still a number, so vec0 answers, fusion gives
+    that ranking a full vote, and the page comes back looking normal and
+    meaning nothing. Nothing raises, so there is no exception a caller could
+    have caught: the mismatch has to be compared for.
+    """
+    from conftest import StubEmbedder
+
+    chunk_id = _insert_doc_with_chunk(vec_conn, path="a.md", body="findable content about widgets")
+    _insert_vector(vec_conn, chunk_id)
+    db.set_meta(vec_conn, db.META_EMBED_MODEL, "model-one")
+
+    other = StubEmbedder(dim=db.EMBED_DIM, model="model-two")
+    response = search.search(vec_conn, vec_ok=True, query="widgets", embedder=other)
+
+    assert response.degraded is True
+    # Both names, because the reason has to say what the index holds AND what
+    # is configured now; either one alone leaves the reader guessing which
+    # half to change.
+    assert "model-one" in response.degraded_reason
+    assert "model-two" in response.degraded_reason
+    assert "reindex" in response.degraded_reason
+    # Degrading is not refusing: the lexical channel still answers.
+    assert len(response.hits) == 1
+    assert response.channels_used == frozenset({search.CHANNEL_LEXICAL})
+
+
+def test_a_stale_model_is_detected_without_embedding_the_query(vec_conn):
+    """The comparison happens before the round trip, not after it.
+
+    Embedding first and comparing afterwards would give the same answer at the
+    cost of a request whose result can never be used, which on a cold local
+    model is seconds of latency for a query that is already decided.
+    """
+    from conftest import StubEmbedder
+
+    chunk_id = _insert_doc_with_chunk(vec_conn, path="a.md", body="findable content about widgets")
+    _insert_vector(vec_conn, chunk_id)
+    db.set_meta(vec_conn, db.META_EMBED_MODEL, "model-one")
+
+    other = StubEmbedder(dim=db.EMBED_DIM, model="model-two")
+    response = search.search(vec_conn, vec_ok=True, query="widgets", embedder=other)
+
+    assert response.degraded is True
+    assert other.calls == []
+
+
+def test_an_index_with_no_recorded_model_is_not_treated_as_stale(vec_conn):
+    """Absence is unknown, not disagreement.
+
+    An index built before ``meta.embed_model`` was written has no stored name.
+    Collapsing that into a mismatch would degrade the vector channel on every
+    such index until someone reindexed, for a configuration that may be
+    perfectly correct.
+    """
+    from conftest import StubEmbedder
+
+    chunk_id = _insert_doc_with_chunk(vec_conn, path="a.md", body="findable content about widgets")
+    _insert_vector(vec_conn, chunk_id)
+    assert db.get_meta(vec_conn, db.META_EMBED_MODEL) is None
+
+    embedder = StubEmbedder(dim=db.EMBED_DIM, model="model-two")
+    response = search.search(vec_conn, vec_ok=True, query="widgets", embedder=embedder)
+
+    assert response.degraded is False
+    assert response.degraded_reason is None
+    assert search.CHANNEL_VECTOR in response.channels_used
+    assert embedder.calls != []
+
+
+def _spy_on_fuse(monkeypatch) -> list[tuple[float, ...] | None]:
+    """Record the weights every ``_fuse`` call receives.
+
+    Asserted at the seam rather than through scores, for the reason
+    test_search_gives_the_graph_list_the_discounted_weight already states: a
+    weight applied to the wrong list produces a ranking that is merely
+    different, and no score assertion separates that from a corpus change.
+    """
+    seen: list[tuple[float, ...] | None] = []
+    real_fuse = search._fuse
+
+    def spy(*ranked_lists, weights=None):
+        seen.append(weights)
+        return real_fuse(*ranked_lists, weights=weights)
+
+    monkeypatch.setattr(search, "_fuse", spy)
+    return seen
+
+
+def _partially_embedded(conn, *, embedded: int, total: int) -> None:
+    """Insert ``total`` chunks and give vectors to only the first ``embedded``."""
+    for i in range(total):
+        chunk_id = _insert_doc_with_chunk(
+            conn, path=f"doc-{i}.md", body=f"widgets and gadgets number {i}"
+        )
+        if i < embedded:
+            _insert_vector(conn, chunk_id)
+
+
+def test_partial_vector_coverage_is_reported_rather_than_read_as_healthy(vec_conn, stub_embedder):
+    """An index that is a quarter embedded used to answer `mode: lexical+vector`
+    with `degraded: false`, so nothing on the page looked wrong.
+
+    This is the ordinary path, not an edge case: embedding is decoupled from
+    change detection, so any index built or grown while the backend was down
+    is partially embedded until a later reindex backfills it.
+    """
+    _partially_embedded(vec_conn, embedded=1, total=4)
+
+    response = search.search(vec_conn, vec_ok=True, query="widgets", embedder=stub_embedder)
+
+    assert response.vector_coverage == 0.25
+    # Not degraded: the channel DID vote. Partial coverage is a third state,
+    # and folding it into the boolean would make an ablation run and a
+    # half-built index indistinguishable.
+    assert response.degraded is False
+    assert search.CHANNEL_VECTOR in response.channels_used
+
+
+def test_partial_coverage_reduces_the_vector_channels_vote(vec_conn, stub_embedder, monkeypatch):
+    """Partial coverage is a BIASED signal, not a weaker one: the channel ranks
+    only within whichever documents happened to be embedded first, and
+    reciprocal-rank fusion otherwise hands that subset a full vote."""
+    _partially_embedded(vec_conn, embedded=1, total=4)
+    seen = _spy_on_fuse(monkeypatch)
+
+    search.search(vec_conn, vec_ok=True, query="widgets", embedder=stub_embedder)
+
+    assert seen[-1] == (1.0, 0.25, search.GRAPH_VOTE_WEIGHT)
+
+
+def test_full_coverage_leaves_the_fusion_arithmetically_unchanged(
+    vec_conn, stub_embedder, monkeypatch
+):
+    """The endpoint that makes this safe to land ahead of the judged set in #42.
+
+    At full coverage the weight is exactly 1.0, so a healthy index fuses
+    precisely as it did before coverage existed. There is no constant here to
+    tune and therefore nothing for an evaluation to arbitrate.
+    """
+    _partially_embedded(vec_conn, embedded=3, total=3)
+    seen = _spy_on_fuse(monkeypatch)
+
+    response = search.search(vec_conn, vec_ok=True, query="widgets", embedder=stub_embedder)
+
+    assert response.vector_coverage == 1.0
+    assert seen[-1] == (1.0, 1.0, search.GRAPH_VOTE_WEIGHT)
+
+
+def test_coverage_is_absent_when_the_vector_channel_did_not_vote(lexical_conn):
+    """``None`` rather than 0.0. A channel that never ran has no coverage to
+    report, and 0.0 would read as "ran and saw nothing", which is the state
+    the degraded flag already describes.
+
+    Weak on its own: with no vec table the coverage is never computed, so this
+    passes whether or not the guard on the response field exists. The case
+    that actually exercises the guard is the next test.
+    """
+    _insert_doc_with_chunk(lexical_conn, path="a.md", body="widgets and gadgets")
+
+    response = search.search(lexical_conn, vec_ok=False, query="widgets")
+
+    assert response.vector_coverage is None
+
+
+def test_coverage_is_withheld_when_it_was_computed_but_the_channel_still_lost(vec_conn):
+    """The state where the guard is the only thing standing: coverage IS known
+    and the channel still did not vote.
+
+    A partially embedded index with an unreachable backend computes coverage
+    from the rows it holds, then degrades before producing a query vector, so
+    the vector channel contributes nothing. Reporting the number anyway would
+    describe a channel absent from this ranking, and a caller reading
+    "coverage 0.25" would reasonably conclude a quarter-strength vector vote
+    was included when there was none.
+    """
+    from conftest import FailingEmbedder
+
+    _partially_embedded(vec_conn, embedded=1, total=4)
+
+    response = search.search(
+        vec_conn, vec_ok=True, query="widgets", embedder=FailingEmbedder()
+    )
+
+    assert response.degraded is True
+    assert search.CHANNEL_VECTOR not in response.channels_used
+    assert response.vector_coverage is None
+
+
+def test_coverage_is_clamped_when_a_vector_outlives_its_chunk(vec_conn, stub_embedder):
+    """A vec row left behind by a deleted chunk would push the ratio above 1
+    and hand the channel MORE than a full vote, which is the one direction
+    this must never move."""
+    chunk_id = _insert_doc_with_chunk(vec_conn, path="a.md", body="widgets and gadgets")
+    _insert_vector(vec_conn, chunk_id)
+    # A second vector row for a chunk id that no longer exists.
+    _insert_vector(vec_conn, chunk_id + 999)
+
+    response = search.search(vec_conn, vec_ok=True, query="widgets", embedder=stub_embedder)
+
+    assert response.vector_coverage == 1.0
+
+
+def test_a_commit_landing_mid_search_cannot_change_what_a_hit_cites(
+    lexical_conn, db_path, monkeypatch
+):
+    """The defect behind issue #65, at its real severity.
+
+    A page is built from several statements. In autocommit each takes its own
+    snapshot, so a reindex committing between the candidate read and the row
+    fetch is not merely a stale page: chunk ids are REUSED. A document whose
+    sections are reordered deletes and reinserts its own chunks, and when it
+    holds the top of the rowid range the reinserts reclaim the ids just freed
+    with different content behind them (verified against the real indexer, not
+    only modelled here). The id that matched "alpha" then resolves to the
+    section holding "bravo", and the page cites a chunk that never matched.
+
+    The oracle is deliberately about CONTENT, not about equality with a value
+    captured earlier: a hit must contain the term it was ranked for. That is
+    the property a reader relies on, and it is false in exactly the broken
+    interleaving.
+    """
+    alpha_id = _insert_doc_with_chunk(
+        lexical_conn, path="a.md", body="alpha " * 30, heading_path="A > One"
+    )
+    bravo_id = _insert_doc_with_chunk(
+        lexical_conn, path="b.md", body="bravo " * 30, heading_path="B > Two"
+    )
+    writer = db.connect(db_path)
+    original = search._lexical_ranked_ids
+    committed = {"done": False}
+
+    def _commit_between_the_candidate_read_and_the_fetch(conn, query, limit):
+        ids = original(conn, query, limit)
+        if not committed["done"]:
+            committed["done"] = True
+            # Another process finishing a reindex, from its own connection.
+            with writer:
+                writer.execute(
+                    "UPDATE chunks SET body = 'bravo rechunked' WHERE id = ?", (alpha_id,)
+                )
+                writer.execute(
+                    "UPDATE chunks SET body = 'alpha rechunked' WHERE id = ?", (bravo_id,)
+                )
+        return ids
+
+    monkeypatch.setattr(
+        search, "_lexical_ranked_ids", _commit_between_the_candidate_read_and_the_fetch
+    )
+    response = search.search(lexical_conn, vec_ok=False, query="alpha")
+    writer.close()
+
+    # The interleaving actually happened; without this the assertion below
+    # would pass on a run where nothing raced at all.
+    assert committed["done"] is True
+    assert response.hits, "the search still has to answer"
+    for hit in response.hits:
+        assert "alpha" in hit.body, f"page cites {hit.heading_path!r}, which never matched"
+
+
+def test_a_commit_landing_before_a_search_is_visible_to_it(lexical_conn, db_path):
+    """Control for the test above, and the reason it is not passing for the
+    wrong reason. The snapshot must isolate a search from a commit that lands
+    DURING it, not hide committed writes from every later search: an index
+    that never showed new content would satisfy the mis-attribution assertion
+    perfectly while being useless.
+    """
+    chunk_id = _insert_doc_with_chunk(lexical_conn, path="a.md", body="alpha " * 30)
+    writer = db.connect(db_path)
+    with writer:
+        writer.execute(
+            "UPDATE chunks SET body = 'alpha rewritten already' WHERE id = ?", (chunk_id,)
+        )
+    writer.close()
+
+    response = search.search(lexical_conn, vec_ok=False, query="alpha")
+
+    assert response.hits
+    assert "rewritten already" in response.hits[0].body
+
+
+def test_a_readers_snapshot_does_not_block_a_writer(lexical_conn, db_path):
+    """The property that makes this fix admissible where reader-side LOCKING
+    was rejected for #55.
+
+    That rejection was empirical and correct about what it tested: a reader
+    holding the writer's ``flock`` ``LOCK_SH`` starves a starting writer's
+    ``LOCK_EX | LOCK_NB``, so every concurrent search became a way to make a
+    reindex fail. A WAL read transaction has the opposite property. Pinned
+    here so that a later change cannot quietly reintroduce a reader that can
+    fail a reindex, which is the failure mode #55 already paid for once.
+    """
+    chunk_id = _insert_doc_with_chunk(lexical_conn, path="a.md", body="alpha " * 30)
+    writer = db.connect(db_path)
+
+    with search._ranking_snapshot(lexical_conn):
+        lexical_conn.execute("SELECT COUNT(*) FROM chunks").fetchone()  # take the snapshot
+        with writer:  # the writer must not be blocked by it
+            writer.execute("UPDATE chunks SET body = 'written during' WHERE id = ?", (chunk_id,))
+        inside = lexical_conn.execute(
+            "SELECT body FROM chunks WHERE id = ?", (chunk_id,)
+        ).fetchone()["body"]
+    after = lexical_conn.execute(
+        "SELECT body FROM chunks WHERE id = ?", (chunk_id,)
+    ).fetchone()["body"]
+    writer.close()
+
+    # Two-sided on purpose: the writer got through AND the reader kept one
+    # generation. Either half alone is satisfiable by a broken implementation.
+    assert inside != "written during"
+    assert after == "written during"
+
+
+def test_the_embedding_round_trip_happens_outside_the_read_snapshot(vec_conn, stub_embedder):
+    """WAL frames cannot be checkpointed past the oldest live reader, and the
+    embed call has a 120 second timeout. Holding the snapshot across it would
+    trade a narrow consistency window for unbounded WAL growth during exactly
+    the reindex that is writing the whole corpus. So the ordering is part of
+    the fix, not an implementation detail.
+    """
+    _partially_embedded(vec_conn, embedded=2, total=2)
+    observed: dict[str, bool] = {}
+    original_embed = stub_embedder.embed
+
+    def _recording_embed(texts):
+        observed["in_transaction"] = vec_conn.in_transaction
+        return original_embed(texts)
+
+    stub_embedder.embed = _recording_embed
+    search.search(vec_conn, vec_ok=True, query="widgets", embedder=stub_embedder)
+
+    assert "in_transaction" in observed, "the vector path did not embed at all"
+    assert observed["in_transaction"] is False
+
+
+def test_the_resolved_supersedence_boolean_reaches_the_hit(lexical_conn):
+    """Issue #73. The value was computed on every query, used for the ranking
+    penalty, and dropped before the hit was built, so no consumer could see
+    the signal the ranking itself reads."""
+    successor = _insert_doc_with_chunk(lexical_conn, path="new.md", body="widgets successor")
+    successor_doc = lexical_conn.execute(
+        "SELECT doc_id FROM chunks WHERE id = ?", (successor,)
+    ).fetchone()["doc_id"]
+    _insert_doc_with_chunk(
+        lexical_conn,
+        path="old.md",
+        body="widgets original",
+        superseded_by="new.md",
+        superseded_by_doc_id=successor_doc,
+    )
+
+    hits = {h.path: h for h in search.search(lexical_conn, vec_ok=False, query="widgets").hits}
+
+    assert hits["old.md"].is_superseded is True
+    assert hits["old.md"].supersedence_unresolved is False
+    # The successor is not itself superseded: without this the test passes on
+    # an implementation that marks everything true.
+    assert hits["new.md"].is_superseded is False
+    assert hits["new.md"].superseded_by is None
+
+
+def test_a_supersedence_claim_that_resolved_to_nothing_is_a_third_state(lexical_conn):
+    """The case the string alone cannot express.
+
+    ``links.py`` builds the edge solely FROM this frontmatter string, so an
+    edge always implies a string while a string can dangle. Publishing only
+    the string made a renamed or mistyped successor read as "retracted" while
+    the ranking treated the record as current at full weight and the
+    assembled chain showed no successor: three surfaces disagreeing with no
+    way for a caller to tell which was authoritative.
+    """
+    _insert_doc_with_chunk(
+        lexical_conn,
+        path="old.md",
+        body="widgets original",
+        superseded_by="renamed-away.md",  # string only, no resolved edge
+    )
+
+    hit = search.search(lexical_conn, vec_ok=False, query="widgets").hits[0]
+
+    assert hit.superseded_by == "renamed-away.md"
+    assert hit.is_superseded is False
+    assert hit.supersedence_unresolved is True
+
+
+def test_a_document_with_no_supersedence_claims_neither_state(lexical_conn):
+    """Control. Both flags false is a distinct answer from either of the two
+    above, and an implementation that conflated absence with an unresolved
+    claim would pass the test above and fail here."""
+    _insert_doc_with_chunk(lexical_conn, path="plain.md", body="widgets plain")
+
+    hit = search.search(lexical_conn, vec_ok=False, query="widgets").hits[0]
+
+    assert hit.superseded_by is None
+    assert hit.is_superseded is False
+    assert hit.supersedence_unresolved is False
+
+
+def test_get_chunk_and_recent_carry_the_same_resolved_value(lexical_conn):
+    """All three read surfaces share ``_HIT_COLUMNS`` and all three dropped
+    the value identically, so fixing only the search path would leave two
+    surfaces still publishing the string alone."""
+    successor = _insert_doc_with_chunk(lexical_conn, path="new.md", body="widgets successor")
+    successor_doc = lexical_conn.execute(
+        "SELECT doc_id FROM chunks WHERE id = ?", (successor,)
+    ).fetchone()["doc_id"]
+    old = _insert_doc_with_chunk(
+        lexical_conn,
+        path="old.md",
+        body="widgets original",
+        superseded_by="new.md",
+        superseded_by_doc_id=successor_doc,
+    )
+    old_ref = lexical_conn.execute("SELECT ref FROM chunks WHERE id = ?", (old,)).fetchone()["ref"]
+
+    assert search.get_chunk(lexical_conn, old_ref).is_superseded is True
+    by_path = {h.path: h for h in search.recent(lexical_conn, limit=10)}
+    assert by_path["old.md"].is_superseded is True
+    assert by_path["new.md"].is_superseded is False
