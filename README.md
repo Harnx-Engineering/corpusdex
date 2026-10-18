@@ -97,6 +97,7 @@ indexed as additional corpus.
 uv run brain reindex        # incremental index over the registered-repo corpus
 uv run brain reindex --json # same, machine-readable stats
 uv run brain reindex --full # re-chunk every document regardless of fingerprint
+uv run brain reindex --allow-empty # permit a run that removes every indexed document
 uv run brain search "..."   # hybrid search, cited results
 uv run brain get <ref>      # full chunk view, by the stable `ref` a search result carries
 uv run brain eval           # recall@k and MRR over eval/queries.yaml, with channel ablation
@@ -528,14 +529,11 @@ case drops the vector channel, answers from the lexical and graph channels,
 and sets `degraded: true` with a `degraded_reason` naming the mismatch. Both
 are cleared by `brain reindex`, which re-embeds at the active model's width.
 
-## Known limitation: same-mtime, same-size edits
+## Every reindex hashes every document
 
-The incremental reindex fast-path skips re-reading a file when its mtime and
-size both match what is stored. If a file is edited in a way that preserves
-both its mtime (e.g. restored via `os.utime` or a tool that pins timestamps)
-and its exact byte size, that edit will not be detected until something else
-changes the file's mtime or size (or `brain reindex --full` is run). This is
-a narrow, deliberate trade-off: reading and hashing every file on every
-reindex would defeat the purpose of the fast path, and same-mtime/same-size
-edits are rare in practice (most editors and git checkouts change at least
-one of the two).
+An incremental reindex reads and hashes each document on every run and
+re-chunks only those whose `size:sha256` fingerprint changed. There is no
+mtime shortcut: one used to skip the read when mtime and size both matched,
+so an edit preserving both (a tool that restores timestamps, two writes in
+one clock tick) was never picked up. Hashing is cheap next to everything else
+a reindex does: about 24 ms for a corpus of 1131 documents and 18.8 MB.

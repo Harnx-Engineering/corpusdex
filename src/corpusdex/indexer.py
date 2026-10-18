@@ -390,6 +390,34 @@ class CorpusRootsUnusable(RuntimeError):
     """
 
 
+class CorpusWouldEmptyIndex(RuntimeError):
+    """Raised when a reindex would remove every document of a non-empty index.
+
+    The general form of #78 (issue #244). A run whose corpus keeps none of the
+    indexed documents deletes all of them in the removal sweep, reports no
+    errors and exits 0, whatever the cause: a registry whose repos are all
+    missing on disk, an exclusion that matches everything, a workspace root
+    pointing somewhere else. Refusing on the OUTCOME catches causes nobody
+    has enumerated, where #78 refused one cause by name. An intentional wipe
+    stays possible with ``allow_empty=True`` (``brain reindex --allow-empty``).
+    """
+
+    def __init__(self, prior: int, discovered: int) -> None:
+        self.prior = prior
+        self.discovered = discovered
+        found = (
+            "found no documents"
+            if discovered == 0
+            else f"found {discovered} documents, none of them already indexed"
+        )
+        super().__init__(
+            f"refusing to reindex: this run {found}, so it would remove all {prior} "
+            "documents in the index. Check the workspace root, the repo registry and "
+            "the corpus roots; if emptying the index is intended, rerun with "
+            "`brain reindex --allow-empty`."
+        )
+
+
 class CorpusRootsCollide(RuntimeError):
     """Raised when two configured corpus roots would claim one citation path.
 
@@ -400,7 +428,7 @@ class CorpusRootsCollide(RuntimeError):
 
     Both outcomes are bad and neither is diagnosable from where it surfaces. A
     fresh index raises ``sqlite3.IntegrityError`` out of the insert. An index
-    that already exists takes the fast path instead, because ``existing`` is a
+    that already exists takes the unchanged path instead, because ``existing`` is a
     snapshot read before the loop, so the second document compares against the
     stale row the first one already deleted, matches its fingerprint, and is
     counted ``unchanged``. The result is a citation that serves a different
@@ -508,6 +536,14 @@ class ReindexStats:
     #: watching. Set from the name only once it is known to match a repo in
     #: scope, so this never asserts treatment that did not happen.
     knowledge_repo: str | None = None
+    #: The name the run RESOLVED, whether or not it matched a repo in scope:
+    #: ``BRAIN_KNOWLEDGE_REPO``, else the repo the engine's checkout belongs
+    #: to. None only when there was nothing to resolve from (an installed
+    #: package with the variable unset). Reported beside ``knowledge_repo``
+    #: so "no repo in scope by design" and "resolved a name that matched
+    #: nothing" stop reading the same; neither is a warning on its own, since
+    #: running against a workspace that is not the engine's is ordinary (#101).
+    knowledge_repo_resolved: str | None = None
 
     #: The database this run actually wrote. Recorded rather than re-derived
     #: by the caller, because the caller would have to resolve it a second
@@ -922,7 +958,7 @@ def _reclassify_after_knowledge_repo_change(conn, knowledge: str | None) -> int:
     ``classify_doc_type`` consults the knowledge repo, so the same file is a
     ``decision`` in the repo that receives whole-tree treatment and a plain
     ``doc`` everywhere else. A document whose bytes did not change takes the
-    unchanged fast path, which returns before the classifier runs, so a run
+    unchanged path, which returns before the classifier runs, so a run
     that changes the knowledge repo leaves those rows asserting a treatment
     the repo no longer receives.
 
@@ -951,24 +987,13 @@ def _reclassify_after_knowledge_repo_change(conn, knowledge: str | None) -> int:
 def _fingerprint(raw: bytes) -> str:
     """A ``size:sha256`` composite fingerprint stored in ``documents.content_hash``.
 
-    Folding size into the stored fingerprint (rather than adding a schema
-    column) lets the mtime fast-path also gate on size with no migration: a
-    same-mtime, different-size edit changes the comparable prefix even before
-    any hash is recomputed. Legacy rows written before this change hold a
-    bare hex digest with no ``:`` separator, which never matches a real
-    ``size:hash`` value, so they safely fall through to a one-time recompute.
+    The size prefix once let an mtime fast path gate on size without reading
+    the file; that fast path is gone (#91) and every run compares the whole
+    fingerprint. Legacy rows written before the prefix hold a bare hex digest
+    with no ``:`` separator, which never matches a real ``size:hash`` value,
+    so they fall through to a one-time recompute.
     """
     return f"{len(raw)}:{hashlib.sha256(raw).hexdigest()}"
-
-
-def _fingerprint_size(fingerprint: str) -> int | None:
-    size_str, sep, _digest = fingerprint.partition(":")
-    if not sep:
-        return None
-    try:
-        return int(size_str)
-    except ValueError:
-        return None
 
 
 def _delete_doc_vectors(conn, vec_ok: bool, doc_id: int) -> None:
@@ -1292,6 +1317,7 @@ def reindex(
     workspace_root: Path | None = None,
     full: bool = False,
     embedder: OllamaEmbedder | None = None,
+    allow_empty: bool = False,
 ) -> ReindexStats:
     """Incrementally (re)build the index from the on-disk corpus.
 
@@ -1303,7 +1329,9 @@ def reindex(
     the database, so no schema write happens outside the lock); raises
     :class:`corpusdex.db.IndexLocked` if another writer already holds it,
     or :class:`RegistryMissing` if no repo registry can be found and no
-    explicit ``BRAIN_CORPUS_ROOTS`` was configured.
+    explicit ``BRAIN_CORPUS_ROOTS`` was configured. Raises
+    :class:`CorpusWouldEmptyIndex`, before any write, when the corpus keeps
+    none of a non-empty index's documents, unless ``allow_empty`` is set.
     """
     start = time.monotonic()
     resolved_db_path = Path(db_path) if db_path is not None else db.default_db_path()
@@ -1329,6 +1357,7 @@ def reindex(
     corpus = discover_corpus(resolved_workspace_root, knowledge)
     stats.docs_seen = len(corpus)
     seen_paths = {doc.rel_path for doc in corpus}
+    stats.knowledge_repo_resolved = knowledge
 
     # Reported only when it names a repo in scope, because reporting a name
     # that applied to nothing would assert whole-tree treatment that did not
@@ -1345,6 +1374,14 @@ def reindex(
     treated_repo = stats.knowledge_repo
 
     with db.write_lock(resolved_db_path):
+        # Read from the LIVE index, under the lock and before anything is
+        # written. Checking inside the pass instead would miss the rebuild
+        # path: a rebuild writes into a fresh scratch file that has no rows to
+        # remove, and the swap then replaces a full index with an empty one.
+        if not allow_empty:
+            prior_paths = db.stored_document_paths(resolved_db_path)
+            if prior_paths and prior_paths.isdisjoint(seen_paths):
+                raise CorpusWouldEmptyIndex(len(prior_paths), len(seen_paths))
         # A rebuild is never done in place. The live index stays untouched
         # until a complete replacement exists, so a concurrent reader cannot
         # observe an empty half-built index and a failed run cannot leave one
@@ -1628,15 +1665,12 @@ def _run_indexing_pass(
 
                 file_mtime = st.st_mtime
 
-                if (
-                    not full
-                    and prior is not None
-                    and prior["mtime"] == file_mtime
-                    and _fingerprint_size(prior["content_hash"]) == st.st_size
-                ):
-                    stats.unchanged += 1
-                    continue
-
+                # Every run reads and hashes every document. A fast path that
+                # skipped the read when mtime and size matched missed an edit
+                # preserving both (a tool restoring mtime, two writes in one
+                # clock tick) forever, with nothing reported (issue #91). It
+                # saved about 23 ms on a 1131-document, 18.8 MB corpus: 1.2 ms
+                # to stat everything against 24 ms to hash everything.
                 try:
                     raw = doc.abs_path.read_bytes()
                 except OSError as exc:
@@ -1645,10 +1679,14 @@ def _run_indexing_pass(
                 fingerprint = _fingerprint(raw)
 
                 if not full and prior is not None and prior["content_hash"] == fingerprint:
-                    conn.execute(
-                        "UPDATE documents SET mtime = ? WHERE id = ?",
-                        (file_mtime, prior["id"]),
-                    )
+                    # Written only when it moved. With every document now on
+                    # this path, an unconditional write is one row update per
+                    # document per run for no information.
+                    if prior["mtime"] != file_mtime:
+                        conn.execute(
+                            "UPDATE documents SET mtime = ? WHERE id = ?",
+                            (file_mtime, prior["id"]),
+                        )
                     stats.unchanged += 1
                     continue
 

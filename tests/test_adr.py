@@ -579,3 +579,52 @@ def test_a_repo_or_tag_that_would_change_the_frontmatter_shape_is_refused(
     with pytest.raises(adr.AdrError, match="plain identifier"):
         adr.create(d, "second", "Second", [bad], [])
     assert not (d / "0002-second.md").exists()
+
+
+def test_a_write_failure_at_the_index_itself_rolls_the_record_back(tmp_path: Path):
+    """The rollback was reached only through the missing-index precondition,
+    so moving that check into ``allocate()`` would have left the ``except``
+    branch in ``create()`` untested with everything green (#119). A read-only
+    index fails at the append's own open, which is the failure the branch is
+    for, and the existing claims must come through byte-identical."""
+    import os
+
+    if hasattr(os, "geteuid") and os.geteuid() == 0:  # pragma: no cover
+        pytest.skip("root ignores file permissions")
+    d = _decisions(tmp_path, {"0001": "first"})
+    index = d / adr.INDEX_NAME
+    before = index.read_bytes()
+    index.chmod(0o444)
+    try:
+        with pytest.raises(PermissionError):
+            adr.create(d, "second", "Second", [], [])
+    finally:
+        index.chmod(0o644)
+    assert not (d / "0002-second.md").exists()
+    assert index.read_bytes() == before
+
+
+def test_an_adr_error_reaches_the_cli_as_a_clean_message(tmp_path: Path, capsys, monkeypatch):
+    """``AdrError`` is in ``_CLEAN_ERRORS``: a message and a nonzero exit, not
+    a traceback. Verified by hand during #89 and pinned here (#119)."""
+    from corpusdex import cli, db
+
+    _decisions(tmp_path, {"0001": "first"}, with_index=False)
+    monkeypatch.setattr(db, "repo_root", lambda: tmp_path)
+    assert cli.main(["adr", "new", "second"]) == 1
+    captured = capsys.readouterr()
+    assert captured.err.startswith("error: ")
+    assert "is missing" in captured.err
+    assert "Traceback" not in captured.err + captured.out
+    assert not (tmp_path / "decisions" / "0002-second.md").exists()
+
+
+def test_bare_brain_adr_prints_help_and_fails(capsys):
+    """With no subcommand there is no ``func`` to fall through to; the
+    contract is help and exit 1, the same as a missing top-level command."""
+    from corpusdex import cli
+
+    assert cli.main(["adr"]) == 1
+    out = capsys.readouterr().out
+    assert "usage:" in out
+    assert "new" in out

@@ -634,23 +634,261 @@ def test_a_submodule_keeps_its_own_name(tmp_path: Path):
     assert db.canonical_checkout(submodule) == submodule
 
 
-def test_a_worktree_of_a_submodule_keeps_its_own_name(tmp_path: Path):
-    """A worktree of a SUBMODULE has a commondir, so the commondir check alone
-    admits it -- and it points at ``.git/modules/<name>``, not at a ``.git``.
-    Following it anyway would name the submodule's worktree after the
-    SUPERPROJECT, indexing one repo's content under another repo's name. The
-    check that the target is really a ``.git`` is what stops that.
+def test_a_worktree_of_a_submodule_resolves_to_the_submodule(tmp_path: Path):
+    """A worktree of a SUBMODULE has a commondir pointing at
+    ``.git/modules/<name>``, a directory physically inside the SUPERPROJECT.
+    Taking that directory's parent would name the worktree after the
+    superproject; keeping the worktree's own directory names it after the task,
+    which is the #86 failure. Git records the owner in ``core.worktree``, and
+    following it gives the submodule's checkout (#99).
     """
-    superproject, _, linked = _real_git_submodule(tmp_path)
+    superproject, submodule, linked = _real_git_submodule(tmp_path)
     # The shape the branch depends on, asserted against what git wrote rather
-    # than against what this test would have written: a commondir IS present,
-    # so the commondir check alone admits this, and it targets
-    # .git/modules/vendored.
+    # than against what this test would have written.
     meta = Path((linked / ".git").read_text().split("gitdir:", 1)[1].strip())
-    assert (meta / "commondir").is_file()
-    resolved = (meta / (meta / "commondir").read_text().strip()).resolve()
-    assert resolved == (superproject / ".git" / "modules" / "vendored").resolve()
+    common = (meta / (meta / "commondir").read_text().strip()).resolve()
+    assert common == (superproject / ".git" / "modules" / "vendored").resolve()
+    assert "worktree = " in (common / "config").read_text()
+    assert db.canonical_checkout(linked) == submodule.resolve()
+    assert db.canonical_checkout(linked).name == "vendored"
+
+
+def _git(cwd: Path, *args: str) -> None:
+    git = shutil.which("git")
+    if git is None:  # pragma: no cover - git is present wherever this repo is
+        pytest.skip("git is not available")
+    subprocess.run([git, *args], cwd=cwd, check=True, capture_output=True, text=True)
+
+
+def _seed(at: Path) -> None:
+    _git(at, "config", "user.email", "tests@example.invalid")
+    _git(at, "config", "user.name", "tests")
+    _git(at, "commit", "-q", "--allow-empty", "-m", "seed")
+
+
+def test_a_worktree_of_a_separate_git_dir_checkout_keeps_its_own_name(tmp_path: Path):
+    """``git init --separate-git-dir`` puts the common dir somewhere not named
+    ``.git`` and records no ``core.worktree`` and no back-reference to the
+    checkout that created it; ``git worktree list`` itself names the STORE as
+    the main worktree. There is nothing to resolve to, so the worktree keeps
+    its own directory rather than inventing an owner.
+    """
+    primary = tmp_path / "the-repo"
+    store = tmp_path / "store.git"
+    _git(tmp_path, "init", "-q", "-b", "main", f"--separate-git-dir={store}", str(primary))
+    _seed(primary)
+    linked = tmp_path / "trees" / "slug"
+    _git(primary, "worktree", "add", "-q", "-b", "slug", str(linked))
+    assert db._core_settings(store) == (False, None)
+    assert db.canonical_checkout(primary) == primary
     assert db.canonical_checkout(linked) == linked
+
+
+@pytest.mark.parametrize("store", ["bare.git", "holder/.git"])
+def test_a_worktree_of_a_bare_repo_keeps_its_own_name(tmp_path: Path, store: str):
+    """A bare repo has no checkout that owns its content, so a worktree of one
+    is decided by ``core.bare``, not by its directory's name. ``holder/.git``
+    is the layout that tells the two apart: a bare repo kept in a directory
+    named ``.git`` would otherwise resolve to ``holder``, a directory that
+    holds no checkout at all."""
+    bare = tmp_path / store
+    bare.parent.mkdir(exist_ok=True)
+    _git(tmp_path, "init", "-q", "--bare", "-b", "main", str(bare))
+    seed = tmp_path / "seed"
+    _git(tmp_path, "clone", "-q", str(bare), str(seed))
+    _seed(seed)
+    _git(seed, "push", "-q", "origin", "HEAD:main")
+    linked = tmp_path / "trees" / "slug"
+    _git(bare, "worktree", "add", "-q", "-b", "slug", str(linked))
+    assert db.canonical_checkout(linked) == linked
+
+
+def test_a_moved_worktree_still_resolves(tmp_path: Path):
+    canonical, linked = _real_git_worktree(tmp_path)
+    moved = tmp_path / "elsewhere" / "renamed"
+    moved.parent.mkdir()
+    _git(canonical, "worktree", "move", str(linked), str(moved))
+    assert db.canonical_checkout(moved) == canonical.resolve()
+
+
+@pytest.mark.parametrize(
+    ("config", "expected"),
+    [
+        ("[core]\n\tbare = true\n", (True, None)),
+        ("[core]\n\tbare\n", (True, None)),
+        ("[CORE]\n\tBare = Yes\n", (True, None)),
+        ("[core]\n\tbare = false\n\tworktree = ../x\n", (False, "../x")),
+        ('[core]\n\tworktree = "../with space"\n', (False, "../with space")),
+        ("[core]\n\tworktree = ../a\n\tworktree = ../b\n", (False, "../b")),
+        ('[core "sub"]\n\tworktree = ../x\n[remote "o"]\n\tbare = true\n', (False, None)),
+        ("# [core]\n; bare = true\n", (False, None)),
+        ("[core]\n\tbare = true # note\n", (True, None)),
+        ("[core]\n\tbare = true ; note\n", (True, None)),
+        ("[core] bare = true\n", (True, None)),
+        ("[core]\n\tbare =\n", (False, None)),
+    ],
+    ids=["bare", "valueless-bare", "case", "worktree", "quoted", "last-wins",
+         "other-sections", "comments", "bare-hash-comment", "bare-semicolon-comment",
+         "same-line-header", "empty-bare"],
+)
+def test_core_settings_reads_only_the_core_section(tmp_path: Path, config, expected):
+    (tmp_path / "config").write_text(config, encoding="utf-8")
+    assert db._core_settings(tmp_path) == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "../plain",
+        "../x # moved",
+        "../x ; moved",
+        '"../has # hash"',
+        '"../with space"   # c',
+        '../a\\"q',
+        "  ../padded  ",
+        '"  ../kept  "',
+        "../ends-in-newline\\n",
+    ],
+    ids=["plain", "hash-comment", "semicolon-comment", "quoted-hash",
+         "quoted-then-comment", "escaped-quote", "padded", "quoted-padding",
+         "trailing-newline"],
+)
+def test_the_config_reader_agrees_with_git_on_values(tmp_path: Path, value: str):
+    """git itself is the oracle: whatever ``git config -f`` returns for a
+    value is what git would resolve, so the reader must return the same."""
+    git = shutil.which("git")
+    if git is None:  # pragma: no cover - git is present wherever this repo is
+        pytest.skip("git is not available")
+    (tmp_path / "config").write_text(f"[core]\n\tworktree = {value}\n", encoding="utf-8")
+    assert db._core_settings(tmp_path) == _git_core_settings(git, tmp_path / "config")
+
+
+def _git_core_settings(git: str, config: Path) -> tuple[bool, str | None]:
+    """``(core.bare, core.worktree)`` as git reads ``config``. ``-z`` ends a
+    value with NUL, so a value that itself ends in a newline survives."""
+    def get(*args: str) -> str | None:
+        done = subprocess.run([git, "config", "-z", "-f", str(config), *args],
+                              capture_output=True, text=True)
+        # 1 is "key not set"; a boolean git rejects as bad is fatal, and
+        # reads false here, so it maps to "not true".
+        assert done.returncode in (0, 1) or "bad boolean" in done.stderr, done.stderr
+        return done.stdout.removesuffix("\0") if done.returncode == 0 else None
+    return get("--type=bool", "core.bare") == "true", get("core.worktree") or None
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        "[core]\n\tworktree = ../a\\\nb\n",
+        "[core]\n\tworktree = ../a\\\n   b  \n",
+        "[core]\n\tworktree = ../a \\\n b\n",
+        '[core]\n\tworktree = "../a\\\nb"\n',
+        "[core]\n\tworktree = ../a\\\\\n\tbare = true\n",
+        "[core]\n\tworktree = ../a # c \\\n\tbare = true\n",
+        "[core]\n\tworktree = ../x\\\n[core]\n\tbare = true\n",
+        "[core]\n\tworktree = ../a\\\n\\\nb\n",
+        "[core]\n\tworktree = ../a\\",
+        "\ufeff[core]\n\tbare = true\n\tworktree = ../b\n",
+        "[core]\n\tbare = 2\n",
+        "[core]\n\tbare = -1\n",
+        "[core]\n\tbare = 0x1\n",
+        "[core]\n\tbare = 010\n",
+        "[core]\n\tbare = 1k\n",
+        "[core]\n\tbare = +1\n",
+        "[core]\n\tbare = 0\n",
+        "[core]\n\tbare = 00\n",
+        "[core]\n\tbare = 0x0\n",
+        "[core]\n\tbare = 0k\n",
+        "[core]\n\tbare = off\n",
+        '[remote "o"]\n\turl = x\\\n[core]\n\tbare = true\n',
+        '[branch "m"]\n\tmerge = x\\\n[core]\n\tworktree = ../a\n',
+        '[remote "o"]\n\t# c \\\n[core]\n\tbare = true\n',
+        '[core]\n\tbare = " 1"\n',
+        '[core]\n\tbare = "\x0c1"\n',
+        '[core]\n\tbare = "1 "\n',
+        "[core]\n\tworktree = ../a\u2028bare = true\n",
+        "[core]\n\tworktree = ../a\x0cb\x0b\n",
+        "[core]\r\n\tworktree = ../a\r\n\tbare = true\r\n",
+        "[core]\r\n\tworktree = ../a\\\r\nb\r\n",
+        "[core]\n\tbare = 2147483647\n",
+        "[core]\n\tbare = 2147483648\n",
+        "[core]\n\tbare = -2147483648\n",
+        "[core]\n\tbare = -2147483649\n",
+        "[core]\n\tbare = 2097152k\n",
+        "[core]\n\tbare = -2g\n",
+        "[core]\n\tbare = 0x80000000\n",
+        "[core]\n\tbare = 99999999999999999999999\n",
+        "[core]\n\tworktree = \\\n   ../a\n",
+        '[core]\n\tworktree = "\\\n   ../a"\n',
+        '[core]\n\tworktree = "" \\\n\t../a\n',
+        "[core]\n\tbare = 0000000000000000000001\n",
+    ],
+    ids=["continuation", "continuation-keeps-indent", "continuation-keeps-space",
+         "continuation-in-quotes", "escaped-backslash-ends-value",
+         "backslash-in-comment", "continuation-swallows-header", "double-continuation",
+         "continuation-at-eof", "bom", "int-2", "int-negative", "int-hex", "int-octal",
+         "int-unit", "int-plus", "int-0", "int-00", "int-hex-0", "int-0-unit", "off",
+         "continuation-in-subsection", "continuation-in-other-subsection",
+         "comment-in-subsection", "int-leading-space", "int-leading-formfeed",
+         "int-trailing-space", "u2028-is-not-a-newline", "formfeed-vt-kept", "crlf",
+         "crlf-continuation", "int-max", "int-max-plus-1", "int-min", "int-min-minus-1",
+         "int-unit-overflow", "int-negative-unit", "int-hex-overflow", "int-huge",
+         "continuation-before-value", "continuation-before-quoted-value",
+         "continuation-after-empty-quotes", "int-long-octal"],
+)
+def test_the_config_reader_agrees_with_git_on_whole_files(tmp_path: Path, config: str):
+    git = shutil.which("git")
+    if git is None:  # pragma: no cover - git is present wherever this repo is
+        pytest.skip("git is not available")
+    (tmp_path / "config").write_text(config, encoding="utf-8")
+    assert db._core_settings(tmp_path) == _git_core_settings(git, tmp_path / "config")
+
+
+@pytest.mark.parametrize("value", ["08", "1t", "2x", "maybe", "0x", "",
+                                   pytest.param("1" * 5000, id="5000-digits")])
+def test_a_boolean_git_rejects_or_reads_false_is_false(value: str):
+    assert db._truthy(value) is False
+
+
+def test_extensions_worktree_config_honours_an_integer(tmp_path: Path):
+    (tmp_path / "config").write_text(
+        "[core]\n\tworktree = ../old\n[extensions]\n\tworktreeConfig = 2\n", encoding="utf-8")
+    (tmp_path / "config.worktree").write_text("[core]\n\tworktree = ../w\n", encoding="utf-8")
+    assert db._core_settings(tmp_path) == (False, "../w")
+
+
+def test_config_worktree_is_read_only_under_the_extension(tmp_path: Path):
+    (tmp_path / "config").write_text("[core]\n\tbare = false\n", encoding="utf-8")
+    (tmp_path / "config.worktree").write_text("[core]\n\tworktree = ../w\n", encoding="utf-8")
+    assert db._core_settings(tmp_path) == (False, None)
+    (tmp_path / "config").write_text(
+        "[core]\n\tbare = false\n\tworktree = ../old\n[extensions]\n\tworktreeConfig = true\n",
+        encoding="utf-8",
+    )
+    assert db._core_settings(tmp_path) == (False, "../w")
+    # core.bare moves the same way, and wins the same way.
+    (tmp_path / "config.worktree").write_text("[core]\n\tbare = true\n", encoding="utf-8")
+    assert db._core_settings(tmp_path)[0] is True
+
+
+def test_a_sparse_submodule_worktree_still_resolves_to_the_submodule(tmp_path: Path):
+    """``git sparse-checkout init`` in a submodule enables
+    ``extensions.worktreeConfig`` and MOVES ``core.worktree`` out of
+    ``config`` into ``config.worktree``. Reading only ``config`` loses the one
+    key naming the owner, and the worktree falls back to its task name."""
+    superproject, submodule, linked = _real_git_submodule(tmp_path)
+    _git(submodule, "sparse-checkout", "init", "--cone")
+    common = superproject / ".git" / "modules" / "vendored"
+    assert "core.worktree" not in db._read_git_config(common / "config")
+    assert db._read_git_config(common / "config.worktree").get("core.worktree")
+    assert db.canonical_checkout(linked) == submodule.resolve()
+
+
+def test_a_core_worktree_that_does_not_exist_keeps_the_callers_directory(tmp_path: Path):
+    common = tmp_path / "modules" / "gone"
+    common.mkdir(parents=True)
+    (common / "config").write_text("[core]\n\tworktree = ../../nowhere\n", encoding="utf-8")
+    assert db._primary_worktree(common) is None
 
 
 def test_a_relative_gitdir_resolves_against_the_worktree(tmp_path: Path):

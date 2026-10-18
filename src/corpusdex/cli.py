@@ -24,10 +24,12 @@ from pathlib import Path
 from . import adr, db
 from . import evaluate as evaluate_mod
 from . import search as search_mod
+from .config import env
 from .embedder import EmbeddingUnavailable, default_embedder
 from .indexer import (
     CorpusRootsCollide,
     CorpusRootsUnusable,
+    CorpusWouldEmptyIndex,
     RegistryInvalid,
     RegistryMissing,
     corpus_scope_resolvable,
@@ -52,6 +54,7 @@ _CLEAN_ERRORS = (
     RegistryInvalid,
     CorpusRootsCollide,
     CorpusRootsUnusable,
+    CorpusWouldEmptyIndex,
     adr.AdrError,
     # A schema violation reaching the CLI is a bug rather than a user error,
     # but a traceback is the worst way to say so: the constraint name is the
@@ -253,7 +256,7 @@ def cmd_recent(args: argparse.Namespace) -> int:
 
 def cmd_reindex(args: argparse.Namespace) -> int:
     embedder = default_embedder()
-    stats = run_reindex(full=args.full, embedder=embedder)
+    stats = run_reindex(full=args.full, embedder=embedder, allow_empty=args.allow_empty)
 
     if args.json:
         print(
@@ -278,6 +281,7 @@ def cmd_reindex(args: argparse.Namespace) -> int:
                     "superseded_by_unresolved": list(stats.superseded_by_unresolved),
                     "duration_seconds": round(stats.duration_seconds, 3),
                     "knowledge_repo": stats.knowledge_repo,
+                    "knowledge_repo_resolved": stats.knowledge_repo_resolved,
                     "reclassified": stats.reclassified,
                     "db_path": stats.db_path,
                     "rebuilt": stats.rebuilt,
@@ -298,6 +302,17 @@ def cmd_reindex(args: argparse.Namespace) -> int:
         print(f"rebuilt the index and swapped it in: {stats.rebuild_reason}")
     if stats.knowledge_repo is not None:
         print(f"knowledge repo: {stats.knowledge_repo} (whole tree indexed)")
+    elif stats.knowledge_repo_resolved is not None and not env("BRAIN_KNOWLEDGE_REPO"):
+        # An explicitly configured name that matched nothing is an operator
+        # error the warning already names; a calm line here would soften it.
+        # Information, not a warning: against a workspace that is not the
+        # engine's own this is the correct outcome. It is printed so the
+        # outcome is visible either way instead of looking like a workspace
+        # with no knowledge repo at all (#101).
+        print(
+            f"knowledge repo: none in scope (resolved "
+            f"{stats.knowledge_repo_resolved!r}, which this run does not index)"
+        )
     if stats.reclassified:
         print(
             f"the knowledge repo changed since the last build: reclassified "
@@ -699,6 +714,11 @@ def build_parser() -> argparse.ArgumentParser:
     p_reindex = sub.add_parser("reindex", help="incrementally reindex the workspace docs corpus")
     p_reindex.add_argument(
         "--full", action="store_true", help="re-chunk every document regardless of its fingerprint"
+    )
+    p_reindex.add_argument(
+        "--allow-empty",
+        action="store_true",
+        help="allow a run that would remove every indexed document",
     )
     p_reindex.add_argument("--json", action="store_true", help="emit JSON")
     p_reindex.set_defaults(func=cmd_reindex)

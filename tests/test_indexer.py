@@ -296,9 +296,9 @@ def test_reindex_content_unchanged_mtime_touched_counts_as_unchanged(tmp_path: P
 
 
 def test_reindex_same_mtime_different_size_is_detected(tmp_path: Path, stub_embedder):
-    # The mtime-only fast path would wrongly skip this edit if the file's
-    # mtime is pinned back to its original value after a content change of a
-    # different length; the size gate must catch what mtime alone misses.
+    # An mtime-only shortcut would wrongly skip this edit if the file's mtime
+    # is pinned back to its original value after a content change of a
+    # different length.
     workspace = tmp_path / "workspace"
     db_path = tmp_path / "var" / "index.db"
     _build_workspace(workspace)
@@ -2140,6 +2140,29 @@ def test_a_run_against_someone_elses_workspace_reports_no_knowledge_repo(
 
     assert stats.knowledge_repo is None
     assert stats.errors == []
+    # ...but the run still says what it resolved, which is what tells this
+    # correct outcome apart from a workspace with no knowledge repo (#101).
+    assert stats.knowledge_repo_resolved == "somewhere-else"
+
+
+def test_with_nothing_to_resolve_from_both_knowledge_fields_are_none(
+    tmp_path: Path, stub_embedder, monkeypatch
+):
+    """An installed package with the variable unset has no checkout to name,
+    so there is no resolved value to report either."""
+    monkeypatch.delenv("BRAIN_KNOWLEDGE_REPO", raising=False)
+    workspace = tmp_path / "workspace"
+    _build_workspace(workspace)
+    monkeypatch.setattr(indexer.db, "source_checkout_root", lambda: None)
+
+    stats = indexer.reindex(
+        db_path=tmp_path / "var" / "index.db",
+        workspace_root=workspace,
+        embedder=stub_embedder,
+    )
+
+    assert stats.knowledge_repo is None
+    assert stats.knowledge_repo_resolved is None
 
 
 def test_a_named_knowledge_repo_that_is_out_of_scope_is_reported(
@@ -2187,7 +2210,7 @@ def test_a_named_knowledge_repo_that_is_in_scope_is_not_reported(
 def test_a_knowledge_repo_change_reclassifies_the_rows_it_retains(tmp_path, monkeypatch):
     """``doc_type`` depends on the knowledge repo, and unchanged files skip it.
 
-    The unchanged fast path returns before ``classify_doc_type`` runs, so a run
+    The unchanged path returns before ``classify_doc_type`` runs, so a run
     that moves the knowledge repo leaves retained rows carrying the previous
     run's classification. Most whole-tree files leave the corpus entirely when
     the repo stops being the knowledge repo and the removal pass handles them;
@@ -2502,3 +2525,175 @@ def test_a_present_but_empty_root_is_not_refused(tmp_path: Path, monkeypatch):
     empty.mkdir(parents=True)
     monkeypatch.setenv("BRAIN_CORPUS_ROOTS", str(empty))
     assert indexer.discover_corpus() == []
+
+
+def test_a_registry_whose_repos_are_all_missing_refuses_and_keeps_the_index(
+    tmp_path: Path, stub_embedder
+):
+    """Issue #244: the route #78 did not close. The registry is present, so
+    discovery succeeds with an empty corpus, and the removal sweep used to
+    delete every document with errors empty and a zero exit."""
+    _build_workspace(tmp_path)
+    db_path = tmp_path / "var" / "index.db"
+    indexer.reindex(db_path=db_path, workspace_root=tmp_path, embedder=stub_embedder)
+    before = _stored_paths(db_path)
+    assert before
+    (tmp_path / "repo-a").rename(tmp_path / "repo-a-moved")
+    assert indexer.discover_corpus(tmp_path) == []
+
+    with pytest.raises(indexer.CorpusWouldEmptyIndex) as excinfo:
+        indexer.reindex(db_path=db_path, workspace_root=tmp_path, embedder=stub_embedder)
+
+    assert excinfo.value.prior == len(before)
+    assert f"all {len(before)} documents" in str(excinfo.value)
+    assert "--allow-empty" in str(excinfo.value)
+    assert _stored_paths(db_path) == before
+
+
+def test_a_full_rebuild_from_an_empty_corpus_is_refused_too(tmp_path: Path, stub_embedder):
+    """A rebuild writes into a fresh scratch file with no rows to remove, so a
+    check inside the removal sweep would pass it, and the swap would replace
+    the full index with an empty one. The check reads the LIVE index."""
+    _build_workspace(tmp_path)
+    db_path = tmp_path / "var" / "index.db"
+    indexer.reindex(db_path=db_path, workspace_root=tmp_path, embedder=stub_embedder)
+    before = _stored_paths(db_path)
+    (tmp_path / "repo-a").rename(tmp_path / "repo-a-moved")
+
+    with pytest.raises(indexer.CorpusWouldEmptyIndex):
+        indexer.reindex(
+            db_path=db_path, workspace_root=tmp_path, embedder=stub_embedder, full=True
+        )
+
+    assert _stored_paths(db_path) == before
+
+
+def test_a_corpus_sharing_no_document_with_the_index_is_refused(
+    tmp_path: Path, monkeypatch, stub_embedder
+):
+    """The refusal is on the outcome, every document removed, not on an
+    empty corpus: a workspace root pointed at the wrong tree finds documents,
+    none of them the indexed ones, and removes all of those."""
+    first = tmp_path / "w1" / "mydocs"
+    other = tmp_path / "w2" / "otherdocs"
+    _write(first / "README.md", "# One\n\n" + "kept content " * 20)
+    _write(other / "README.md", "# Two\n\n" + "other content " * 20)
+    db_path = tmp_path / "var" / "index.db"
+    monkeypatch.setenv("BRAIN_CORPUS_ROOTS", str(first))
+    indexer.reindex(db_path=db_path, embedder=stub_embedder)
+
+    monkeypatch.setenv("BRAIN_CORPUS_ROOTS", str(other))
+    with pytest.raises(indexer.CorpusWouldEmptyIndex) as excinfo:
+        indexer.reindex(db_path=db_path, embedder=stub_embedder)
+
+    assert "found 1 documents, none of them already indexed" in str(excinfo.value)
+    assert _stored_paths(db_path) == ["mydocs/README.md"]
+
+
+def test_keeping_one_document_is_an_ordinary_run(tmp_path: Path, monkeypatch, stub_embedder):
+    """The narrowness control: removing all but one document is allowed."""
+    root = tmp_path / "w1" / "mydocs"
+    _write(root / "README.md", "# One\n\n" + "kept content " * 20)
+    _write(root / "docs" / "gone.md", "# Gone\n\n" + "removed content " * 20)
+    db_path = tmp_path / "var" / "index.db"
+    monkeypatch.setenv("BRAIN_CORPUS_ROOTS", str(root))
+    indexer.reindex(db_path=db_path, embedder=stub_embedder)
+    assert len(_stored_paths(db_path)) == 2
+    (root / "docs" / "gone.md").unlink()
+
+    stats = indexer.reindex(db_path=db_path, embedder=stub_embedder)
+
+    assert stats.removed == 1
+    assert _stored_paths(db_path) == ["mydocs/README.md"]
+
+
+def test_an_empty_corpus_against_an_empty_index_is_not_refused(tmp_path: Path, monkeypatch):
+    """Nothing to lose: a first run over an empty root builds an empty index."""
+    empty = tmp_path / "w1" / "empty"
+    empty.mkdir(parents=True)
+    monkeypatch.setenv("BRAIN_CORPUS_ROOTS", str(empty))
+    stats = indexer.reindex(db_path=tmp_path / "var" / "index.db")
+    assert stats.docs_seen == 0 and stats.removed == 0
+
+
+def test_allow_empty_performs_the_intended_wipe(tmp_path: Path, stub_embedder):
+    _build_workspace(tmp_path)
+    db_path = tmp_path / "var" / "index.db"
+    indexer.reindex(db_path=db_path, workspace_root=tmp_path, embedder=stub_embedder)
+    prior = len(_stored_paths(db_path))
+    (tmp_path / "repo-a").rename(tmp_path / "repo-a-moved")
+
+    stats = indexer.reindex(
+        db_path=db_path, workspace_root=tmp_path, embedder=stub_embedder, allow_empty=True
+    )
+
+    assert stats.removed == prior
+    assert _stored_paths(db_path) == []
+
+
+def test_reindex_same_mtime_same_size_different_content_is_detected(
+    tmp_path: Path, stub_embedder
+):
+    """Issue #91: the edit an mtime-and-size fast path could never see. Same
+    byte count, mtime restored, different bytes: it used to count unchanged
+    forever and leave the old chunks serving."""
+    workspace = tmp_path / "workspace"
+    db_path = tmp_path / "var" / "index.db"
+    _build_workspace(workspace)
+    indexer.reindex(db_path=db_path, workspace_root=workspace, embedder=stub_embedder)
+
+    target = workspace / "repo-a" / "AGENTS.md"
+    original = target.read_bytes()
+    original_stat = target.stat()
+    edited = original.replace(b"text", b"TEXT")
+    assert edited != original and len(edited) == len(original)
+    target.write_bytes(edited)
+    os.utime(target, ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns))
+    assert target.stat().st_mtime_ns == original_stat.st_mtime_ns
+    assert target.stat().st_size == original_stat.st_size
+
+    stats = indexer.reindex(db_path=db_path, workspace_root=workspace, embedder=stub_embedder)
+
+    assert stats.changed == 1
+    conn = db.connect(db_path)
+    try:
+        bodies = [
+            r["body"]
+            for r in conn.execute(
+                "SELECT c.body FROM chunks c JOIN documents d ON d.id = c.doc_id "
+                "WHERE d.path = 'repo-a/AGENTS.md'"
+            )
+        ]
+    finally:
+        conn.close()
+    assert any("TEXT" in body for body in bodies)
+    assert not any(" text " in body for body in bodies), "the old chunks must be gone"
+
+
+def test_an_unchanged_run_writes_no_document_row(tmp_path: Path, stub_embedder):
+    """Every document now reaches the hash comparison, so the stored mtime is
+    written only when it moved; otherwise each run would rewrite every row."""
+    workspace = tmp_path / "workspace"
+    db_path = tmp_path / "var" / "index.db"
+    _build_workspace(workspace)
+    indexer.reindex(db_path=db_path, workspace_root=workspace, embedder=stub_embedder)
+    conn = db.connect(db_path)
+    try:
+        conn.execute("CREATE TABLE doc_writes (n INTEGER)")
+        conn.execute("INSERT INTO doc_writes VALUES (0)")
+        conn.execute(
+            "CREATE TRIGGER count_doc_writes AFTER UPDATE ON documents "
+            "BEGIN UPDATE doc_writes SET n = n + 1; END"
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+    stats = indexer.reindex(db_path=db_path, workspace_root=workspace, embedder=stub_embedder)
+
+    assert stats.unchanged == stats.docs_seen
+    conn = db.connect(db_path)
+    try:
+        assert conn.execute("SELECT n FROM doc_writes").fetchone()[0] == 0
+    finally:
+        conn.close()

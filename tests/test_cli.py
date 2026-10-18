@@ -168,6 +168,7 @@ def test_cli_reindex_json(cli_env, capsys, monkeypatch):
     # by VALUE: presence alone passes for a field wired to a constant None or
     # to the wrong stats attribute, which is most of what can go wrong here.
     assert payload["knowledge_repo"] == "repo-a"
+    assert payload["knowledge_repo_resolved"] == "repo-a"
     # Not always the index the reader will search next: the state directory
     # follows the checkout the command runs from, the corpus follows the
     # checkout that owns the content.
@@ -181,6 +182,46 @@ def test_cli_reindex_names_the_index_it_wrote(cli_env, capsys, monkeypatch):
     out = capsys.readouterr().out
     assert "knowledge repo: repo-a (whole tree indexed)" in out
     assert "index: " in out
+
+
+def test_cli_reindex_says_what_it_resolved_when_nothing_matched(
+    cli_env, capsys, monkeypatch
+):
+    """Against a workspace that is not the engine's own, the resolved name
+    matches nothing and that is correct, so no warning. It is still printed,
+    because without it the run reads exactly like a workspace that has no
+    knowledge repo at all (#101)."""
+    monkeypatch.delenv("BRAIN_KNOWLEDGE_REPO", raising=False)
+    monkeypatch.setattr(
+        cli.db, "canonical_checkout", lambda root: Path("/elsewhere/not-indexed")
+    )
+    monkeypatch.setattr(cli.db, "source_checkout_root", lambda: Path("/elsewhere/x"))
+    assert cli.main(["reindex"]) == 0
+    out = capsys.readouterr().out
+    assert "knowledge repo: none in scope (resolved 'not-indexed'" in out
+    assert "BRAIN_KNOWLEDGE_REPO" not in out
+
+    assert cli.main(["reindex", "--json"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["knowledge_repo"] is None
+    assert payload["knowledge_repo_resolved"] == "not-indexed"
+    # The fixture's stub embedder reports itself unavailable; that error is
+    # not this test's business, a knowledge-repo warning would be.
+    assert not [e for e in payload["errors"] if "BRAIN_KNOWLEDGE_REPO" in e]
+
+
+def test_cli_reindex_does_not_soften_a_configured_name_that_matched_nothing(
+    cli_env, capsys, monkeypatch
+):
+    """An explicitly configured name that matches nothing is an operator
+    error, and the warning names it. The calm information line would present
+    it on stdout as the ordinary not-my-workspace case, to a reader who only
+    captures stdout."""
+    monkeypatch.setenv("BRAIN_KNOWLEDGE_REPO", "nope")
+    assert cli.main(["reindex"]) == 0
+    captured = capsys.readouterr()
+    assert "none in scope (resolved" not in captured.out
+    assert "BRAIN_KNOWLEDGE_REPO names 'nope'" in captured.out + captured.err
 
 
 def test_cli_status_reports_the_repo_the_OPEN_INDEX_was_built_with(
@@ -1035,3 +1076,31 @@ def test_the_human_output_does_not_print_an_unresolved_claim_as_a_retraction(cli
     assert "renamed-away.md" in out, "the claim is still shown, it is not hidden"
     assert "UNRESOLVED" in out
     assert "treated as current" in out
+
+
+def test_a_reindex_that_would_empty_the_index_fails_and_allow_empty_opts_in(
+    cli_env, capsys
+):
+    """Issue #244 through the real command: every registered repo is gone from
+    disk, the case a scheduled run hits after a workspace move."""
+    workspace, db_path = cli_env
+
+    def paths() -> list[str]:
+        conn = db.connect(db_path)
+        try:
+            return [r["path"] for r in conn.execute("SELECT path FROM documents ORDER BY path")]
+        finally:
+            conn.close()
+
+    before = paths()
+    assert before
+    (workspace / "repo-a").rename(workspace / "repo-a-moved")
+
+    assert cli.main(["reindex"]) == 1
+    err = capsys.readouterr().err
+    assert err.startswith("error: refusing to reindex")
+    assert "Traceback" not in err and "--allow-empty" in err
+    assert paths() == before
+
+    assert cli.main(["reindex", "--allow-empty"]) == 0
+    assert paths() == []

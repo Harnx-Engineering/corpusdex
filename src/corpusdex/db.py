@@ -274,7 +274,8 @@ def canonical_checkout(root: Path) -> Path:
     that directory holds a ``commondir`` pointing back at the canonical
     ``.git``. A submodule's ``.git`` is also a file, but its metadata
     directory has no ``commondir``, so a submodule keeps its own name, which
-    is correct -- a submodule IS its own repo.
+    is correct -- a submodule IS its own repo. Which checkout owns the common
+    dir is then read from git's config, see :func:`_primary_worktree`.
 
     Anything unresolvable returns ``root`` unchanged. This runs on the way to
     naming a repo, not on the way to deleting anything, so a checkout git
@@ -317,9 +318,173 @@ def canonical_checkout(root: Path) -> Path:
         target = (gitdir / common.read_text(encoding="utf-8").strip()).resolve()
     except (OSError, UnicodeDecodeError):
         return root
-    if target.name != ".git":
-        return root
-    return target.parent
+    return _primary_worktree(target) or root
+
+
+_ESCAPES = {"n": "\n", "t": "\t", "b": "\b", '"': '"', "\\": "\\"}
+# git's config whitespace. str.strip() and splitlines() also take \f, \v,
+# \x85 and U+2028, which git keeps as value characters.
+_SPACE = " \t\r\n"
+
+
+def _config_value(raw: str, rest: Iterator[str]) -> str:
+    """Decode one git config value: quotes, escapes and inline comments.
+
+    Outside double quotes a ``#`` or ``;`` starts a comment and surrounding
+    whitespace is dropped; inside them both are literal. ``git config`` reads
+    ``worktree = ../x # moved`` as ``../x``, so a reader that kept the
+    comment would resolve a path that does not exist.
+
+    A lone backslash ending the line continues the value onto the next line,
+    which is taken from ``rest`` verbatim, even when it looks like a header;
+    its leading whitespace is kept once the value has begun. A backslash inside a comment does not
+    continue, and an escaped ``\\\\`` is a literal backslash.
+    """
+    out: list[str] = []
+    protected = 0  # length of out that came from quotes or escapes
+    quoted = False
+    i = 0
+    while i < len(raw):
+        c = raw[i]
+        if c == "\\" and i + 1 == len(raw):
+            raw, i = next(rest, ""), 0
+            continue
+        if c == "\\":
+            out.append(_ESCAPES.get(raw[i + 1], raw[i + 1]))
+            protected = len(out)
+            i += 2
+            continue
+        if c == '"':
+            quoted = not quoted
+        elif quoted:
+            out.append(c)
+            protected = len(out)
+        elif c in "#;":
+            break
+        elif c in _SPACE and not out:
+            pass  # git skips unquoted space until the value starts
+        else:
+            out.append(c)
+        i += 1
+    value = "".join(out)
+    return value[:protected] + value[protected:].rstrip(_SPACE)
+
+
+def _read_git_config(path: Path) -> dict[str, str | None]:
+    """Read one git config file into ``{"section.key": value}``, last wins.
+
+    A minimal reader rather than :mod:`configparser`: git's format has quoted
+    subsection headers, repeated keys, value-less booleans and inline
+    comments, any of which a stricter INI parser rejects or misreads. Keys of
+    a subsection (``[remote "o"]``) are skipped, since nothing here wants
+    them. A value-less key reads as None. ``include`` is not followed. A
+    leading byte-order mark is dropped, as git drops it.
+    """
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return {}
+    found: dict[str, str | None] = {}
+    section: str | None = None
+    lines = iter(text.removeprefix("\ufeff").split("\n"))
+    for raw in lines:
+        line = raw.strip(_SPACE)
+        if line.startswith("["):
+            header, _, line = line[1:].partition("]")
+            header = header.strip(_SPACE)
+            section = None if (" " in header or "\t" in header) else header.lower()
+            line = line.strip(_SPACE)
+        if not line or line[0] in "#;":
+            continue
+        key, sep, value = line.partition("=")
+        # Decoded even in a skipped subsection: a continuation there still
+        # swallows the next line, which may look like a [core] header.
+        decoded = _config_value(value.strip(_SPACE), lines) if sep else None
+        if section is not None:
+            found[f"{section}.{key.strip(_SPACE).lower()}"] = decoded
+    return found
+
+
+# git_parse_maybe_bool falls back to strtoimax(base 0) plus a k/m/g unit;
+# strtoimax skips C whitespace first, and the result must fit a C int.
+_GIT_INT = re.compile(
+    r"[ \t\n\v\f\r]*(?P<sign>[+-]?)"
+    r"(?:0[xX](?P<hex>[0-9a-fA-F]+)|(?P<oct>0[0-7]*)|(?P<dec>[1-9][0-9]*))"
+    r"(?P<unit>[kKmMgG]?)"
+)
+_UNITS = {"": 1, "k": 1 << 10, "m": 1 << 20, "g": 1 << 30}
+
+
+def _truthy(value: str | None) -> bool:
+    """Read a boolean as git does: any nonzero integer is true.
+
+    git honours ``core.bare = 2`` and ``worktreeConfig = 0x1``. A value git
+    rejects as a bad boolean (it refuses to run) reads as false here.
+    """
+    if value is None or value.lower() in ("true", "yes", "on"):
+        return True
+    number = _GIT_INT.fullmatch(value)
+    if number is None or len(number["dec"] or "") > 10:
+        return False  # more than 10 decimal digits cannot fit a C int
+    if number["hex"]:
+        n = int(number["hex"], 16)
+    elif number["oct"]:
+        n = int(number["oct"], 8)
+    else:
+        n = int(number["dec"])
+    n *= _UNITS[number["unit"].lower()]
+    if number["sign"] == "-":
+        n = -n
+    return n != 0 and -(1 << 31) <= n < 1 << 31
+
+
+def _core_settings(common: Path) -> tuple[bool, str | None]:
+    """Read ``core.bare`` and ``core.worktree`` as git would for ``common``.
+
+    With ``extensions.worktreeConfig`` set, git also reads
+    ``config.worktree`` from the same directory and it wins, and that is
+    where ``git sparse-checkout init`` MOVES ``core.worktree`` in a submodule.
+    Reading only ``config`` there would lose the one key that names the owner.
+    """
+    settings = _read_git_config(common / "config")
+    if "extensions.worktreeconfig" in settings and _truthy(
+        settings["extensions.worktreeconfig"]
+    ):
+        settings.update(_read_git_config(common / "config.worktree"))
+    bare = "core.bare" in settings and _truthy(settings["core.bare"])
+    worktree = settings.get("core.worktree") or None
+    return bare, worktree
+
+
+def _primary_worktree(common: Path) -> Path | None:
+    """Return the working tree that owns a common git dir, or None.
+
+    Decided by what git records, not by the directory's name (#99):
+
+    * ``core.bare`` -- a bare repo has no owning checkout, so None.
+    * ``core.worktree`` -- git's own answer, resolved against the common dir.
+      A submodule's common dir is ``.git/modules/<name>`` and records its
+      checkout here, so a worktree of a submodule resolves to the submodule,
+      never to the superproject that physically contains the git dir.
+    * a common dir named ``.git`` -- its parent, the ordinary layout.
+
+    Anything else is a ``--separate-git-dir`` store: git keeps no
+    back-reference to the checkout that created it (``git worktree list``
+    itself names the store as the main worktree), so there is nothing to
+    resolve to and the caller keeps its own directory.
+    """
+    bare, worktree = _core_settings(common)
+    if bare:
+        return None
+    if worktree is not None:
+        candidate = Path(worktree).expanduser()
+        if not candidate.is_absolute():
+            candidate = common / candidate
+        candidate = candidate.resolve()
+        return candidate if candidate.is_dir() else None
+    if common.name == ".git":
+        return common.parent
+    return None
 
 
 def repo_root() -> Path:
@@ -714,6 +879,31 @@ def stored_meta(db_path: Path, key: str) -> str | None:
         return None if row is None else row["value"]
     except sqlite3.DatabaseError:
         return None
+    finally:
+        conn.close()
+
+
+def stored_document_paths(db_path: Path) -> set[str]:
+    """Paths of every document in an existing index, read without modifying it.
+
+    Opened read-only for the reason given in :func:`stored_schema_version`. A
+    missing, unreadable or pre-schema index has no documents to lose, so it
+    reads as empty rather than raising.
+    """
+    try:
+        uri = f"{Path(db_path).resolve().as_uri()}?mode=ro"
+        conn = sqlite3.connect(uri, uri=True)
+    except (sqlite3.OperationalError, ValueError):
+        return set()
+    try:
+        present = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'documents'"
+        ).fetchone()
+        if present is None:
+            return set()
+        return {row[0] for row in conn.execute("SELECT path FROM documents")}
+    except sqlite3.DatabaseError:
+        return set()
     finally:
         conn.close()
 
