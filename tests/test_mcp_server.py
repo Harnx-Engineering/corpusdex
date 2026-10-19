@@ -125,6 +125,10 @@ def test_brain_status_reports_cleanly_when_index_was_never_built(tmp_path_factor
 
     assert result["status"].is_error
     assert result["search"].is_error
+    # The message is the remedy: mcp 2.3 hides the text of any exception that
+    # is not a ToolError, which would leave the caller a bare failure.
+    assert "brain reindex" in result["status"].content[0].text
+    assert "brain reindex" in result["search"].content[0].text
     assert not db_path.exists()
 
 
@@ -238,6 +242,7 @@ def test_brain_search_rejects_negative_n(mcp_scenario):
 def test_brain_search_rejects_zero_n(mcp_scenario):
     result = mcp_scenario["zero_n_search"]
     assert result.is_error
+    assert "positive integer" in result.content[0].text
 
 
 LINKED_QUERY = "watering"
@@ -362,3 +367,66 @@ def test_brain_status_reports_the_same_fields_as_brain_status_cli(mcp_scenario):
     # HARNX_BRAIN_OLLAMA_HOST, so its own embedder probe must report down.
     assert payload["embed_backend_live"] == "unavailable"
     assert payload["embed_backend_detail"]
+
+
+async def _call_each_tool(*, workspace_root: Path, db_path: Path, ollama: str) -> dict:
+    params = StdioServerParameters(
+        command=sys.executable,
+        args=["-m", "corpusdex.mcp_server"],
+        env={
+            "BRAIN_WORKSPACE_ROOT": str(workspace_root),
+            "BRAIN_DB": str(db_path),
+            "BRAIN_OLLAMA_HOST": ollama,
+        },
+    )
+    async with stdio_client(params) as (read, write):
+        async with ClientSession(read, write) as session:
+            await session.initialize()
+            return {
+                "status": await session.call_tool("brain_status", {}),
+                "search": await session.call_tool("brain_search", {"query": "cache"}),
+                "get": await session.call_tool("brain_get", {"ref": "cdeadbeefdeadbeef"}),
+                "blank_get": await session.call_tool("brain_get", {"ref": "   "}),
+            }
+
+
+def _built_index(tmp_path: Path) -> tuple[Path, Path]:
+    workspace = tmp_path / "workspace"
+    db_path = tmp_path / "var" / "index.db"
+    _write(workspace / "repo-a" / "AGENTS.md", f"# A\n\n## {CORPUS_HEADING}\n\n{CORPUS_BODY}")
+    write_registry(workspace, ["repo-a"])
+    indexer.reindex(db_path=db_path, workspace_root=workspace, embedder=StubEmbedder())
+    return workspace, db_path
+
+
+def test_a_schema_mismatch_reaches_the_client_with_its_remedy(tmp_path: Path):
+    """mcp 2.3 hides the text of any exception that is not a ToolError. A
+    newer index is the one this server is most likely to meet (it outlives
+    an upgrade), and its message says to restart the server."""
+    workspace, db_path = _built_index(tmp_path)
+    conn = db.connect(db_path)
+    db.set_meta(conn, db.META_SCHEMA_VERSION, str(db.SCHEMA_VERSION + 1))
+    conn.commit()
+    conn.close()
+    result = asyncio.run(_call_each_tool(
+        workspace_root=workspace, db_path=db_path, ollama=UNREACHABLE_OLLAMA_HOST))
+    for name in ("status", "search", "get"):
+        assert result[name].is_error, name
+        assert "restart it" in result[name].content[0].text, name
+
+
+def test_a_rejected_embedding_host_reaches_the_client(tmp_path: Path):
+    workspace, db_path = _built_index(tmp_path)
+    result = asyncio.run(_call_each_tool(
+        workspace_root=workspace, db_path=db_path, ollama="http://example.invalid:11434"))
+    for name in ("status", "search"):
+        assert result[name].is_error, name
+        assert "must be loopback" in result[name].content[0].text, name
+
+
+def test_a_blank_ref_is_refused_with_its_reason(tmp_path: Path):
+    workspace, db_path = _built_index(tmp_path)
+    result = asyncio.run(_call_each_tool(
+        workspace_root=workspace, db_path=db_path, ollama=UNREACHABLE_OLLAMA_HOST))
+    assert result["blank_get"].is_error
+    assert "non-empty string" in result["blank_get"].content[0].text

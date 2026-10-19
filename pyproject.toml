@@ -9,7 +9,7 @@ dependencies = [
   "sqlite-vec>=0.1.6",
   "httpx>=0.27",
   "PyYAML>=6.0",
-  "mcp>=2.0.0",
+  "mcp>=2.2.0",
 ]
 
 [project.scripts]

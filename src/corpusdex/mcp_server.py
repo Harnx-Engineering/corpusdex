@@ -17,17 +17,27 @@ the same reason, every ``open_index`` call here uses the default
 ``create=False``: a read tool called before the index has ever been built
 raises :class:`corpusdex.db.IndexMissing` (surfaced to the MCP client as a
 tool error) rather than silently minting an empty index.
+
+Every failure a caller can act on is raised as :class:`ToolError`, the one
+type the SDK passes through with its message. "Can act on" is the CLI's own
+``_CLEAN_ERRORS`` set, so the two surfaces cannot drift apart on it. Since mcp 2.3 any other
+exception is treated as a crash and the client sees only ``Error executing
+tool <name>``, which would hide the instruction to run ``brain reindex``
+and the stale-ref hint behind a bare failure.
 """
 
 from __future__ import annotations
 
+import contextlib
+from collections.abc import Iterator
 from typing import Any
 
 from mcp.server import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from . import db
 from . import search as search_mod
-from .cli import _hit_dict, status_payload
+from .cli import _CLEAN_ERRORS, _hit_dict, status_payload
 from .config import env
 from .embedder import default_embedder
 
@@ -64,6 +74,20 @@ mcp = MCPServer(
 )
 
 
+@contextlib.contextmanager
+def _caller_errors() -> Iterator[None]:
+    """Re-raise a failure the CLI prints cleanly as a :class:`ToolError`.
+
+    A missing or mismatched index, a rejected embedding host: the message is
+    the remedy, and anything else the SDK would hide behind a bare failure.
+    A real crash still raises unchanged and stays in the server log.
+    """
+    try:
+        yield
+    except _CLEAN_ERRORS as exc:
+        raise ToolError(str(exc)) from exc
+
+
 @mcp.tool()
 def brain_search(query: str, n: int = 8) -> dict[str, Any]:
     """Hybrid (lexical + vector) search over the indexed corpus.
@@ -90,13 +114,14 @@ def brain_search(query: str, n: int = 8) -> dict[str, Any]:
     before trusting relative ordering, not as an error.
     """
     if n < 1:
-        raise ValueError(f"n must be a positive integer, got {n}")
-    embedder = default_embedder()
-    conn, vec_ok = db.open_index()
-    try:
-        response = search_mod.search(conn, vec_ok, query, limit=n, embedder=embedder)
-    finally:
-        conn.close()
+        raise ToolError(f"n must be a positive integer, got {n}")
+    with _caller_errors():
+        embedder = default_embedder()
+        conn, vec_ok = db.open_index()
+        try:
+            response = search_mod.search(conn, vec_ok, query, limit=n, embedder=embedder)
+        finally:
+            conn.close()
     return {
         "query": response.query,
         "mode": response.mode,
@@ -124,14 +149,15 @@ def brain_get(ref: str) -> dict[str, Any]:
     to.
     """
     if not isinstance(ref, str) or not ref.strip():
-        raise ValueError("ref must be a non-empty string from a brain_search result")
-    conn, _vec_ok = db.open_index()
-    try:
-        hit = search_mod.get_chunk(conn, ref)
-    finally:
-        conn.close()
+        raise ToolError("ref must be a non-empty string from a brain_search result")
+    with _caller_errors():
+        conn, _vec_ok = db.open_index()
+        try:
+            hit = search_mod.get_chunk(conn, ref)
+        finally:
+            conn.close()
     if hit is None:
-        raise ValueError(
+        raise ToolError(
             f"no chunk with ref {ref!r}; the section it named may have been "
             "renamed or removed. Run brain_search again for a current ref."
         )
@@ -146,7 +172,8 @@ def brain_status() -> dict[str, Any]:
     document/chunk/embedded-chunk counts, schema version, last reindex
     time, and whether the embedding backend is live right now.
     """
-    return status_payload()
+    with _caller_errors():
+        return status_payload()
 
 
 def main() -> None:
